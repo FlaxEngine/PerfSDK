@@ -14,9 +14,46 @@ NVIDIA Nsight PerfSDK integration for the Flax Editor GPU Profiler. Click a GPU 
 ## Setup
 
 1. Set `NVPERF_SDK_PATH` in your user/system environment.
-2. Clone plugin via Editor [Plugin Window tool](https://docs.flaxengine.com/manual/scripting/plugins/plugin-project.html#automated-git-cloning)
+2. Clone plugin via Editor [Plugin Window tool](https://docs.flaxengine.com/manual/scripting/plugins/plugin-project.html#automated-git-cloning), ensure game project references it:
+
+```
+...
+"References": [
+    {
+        "Name": "$(EnginePath)/Flax.flaxproj"
+    },
+    {
+        "Name": "$(ProjectPath)/Plugins/PerfSDK/PerfSDK.flaxproj"
+    }
+]
+```
+
 2. Open the project and **Build & Run** (or compile scripts) so the PerfSDK plugin native module links against NVPerf.
 3. Play the scene, open **Profiler → GPU**, enable live recording, then **left-click** a region.
+
+## Supported Platforms
+
+Platforms:
+* Windows x64
+
+Graphics APIs:
+* DirectX 11
+* DirectX 12
+* Vulkan
+
+## API
+
+In order to access PErfSDK API in C++/C# scripting import it in your code module (modify `Game.Build.cs` file):
+
+```cs
+public override void Setup(BuildOptions options)
+{
+    base.Setup(options);
+
+    // Adds PerfSDF module to PrivateDependencies if supported on current platform (eg. Windows x64)
+    PerfSDF.ConditionalImport(options, options.PrivateDependencies);
+}
+```
 
 ## Architecture
 
