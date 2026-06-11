@@ -1,0 +1,14 @@
+{
+	"Name": "PerfSDK",
+	"Version": "1.0",
+	"MinEngineVersion": "1.13",
+	"Company": "NVIDIA",
+	"Copyright": "Copyright (c) NVIDIA Corporation. All rights reserved.",
+	"GameTarget": "PerfSDKTarget",
+	"EditorTarget": "PerfSDKEditorTarget",
+	"References": [
+		{
+			"Name": "$(EnginePath)/Flax.flaxproj"
+		}
+	]
+}

@@ -1,0 +1,1496 @@
+// Copyright (c) Flax Engine. Nsight Perf SDK HUD helper for RenderPerfSDK.
+//
+// All backends (D3D11, D3D12, Vulkan) use the NVIDIA Perf SDK Range Profiler to collect
+// *true per-region* GPU counters: the clicked GPU profiler scope is bracketed with
+// PushRange/PopRange in the command stream, and the metric set is gathered over the few
+// passes the configuration needs (one pass per frame the region executes).
+//
+// D3D11 is immediate-mode, so BeginPass/PushRange/PopRange/EndPass happen inline during
+// the region event. D3D12/Vulkan are deferred: queue-level BeginPass/EndPass bracket the
+// whole frame (driven by GPUDevice::DrawBegin/DrawEnd before/after command-list submission),
+// while command-list/command-buffer PushRange/PopRange mark the region during recording.
+// BeginSession for D3D12/Vulkan runs at DrawBegin (OnFrameBegin), before any queue submit —
+// the same point as NvPerf ReportGeneratorVulkan::OnFrameStart.
+
+#include "PerfSdkHud.h"
+#include "Engine/Core/Log.h"
+#include "Engine/Core/Types/StringBuilder.h"
+#include "Engine/Engine/Engine.h"
+#include "Engine/Platform/Platform.h"
+#include "Engine/Platform/StringUtils.h"
+
+#if COMPILE_WITH_RENDER_PERF_NVPERF
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef NOGDI
+#define NOGDI
+#endif
+
+#include <cstdarg>
+#include <cstdio>
+#include <algorithm>
+#include <cmath>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <d3d11.h>
+#include <d3d12.h>
+#include <dxgi.h>
+#include <wrl/client.h>
+
+#if PLATFORM_WIN32
+#include "Engine/Platform/Win32/IncludeWindowsHeaders.h"
+#endif
+#include <ThirdParty/volk/volk.h>
+
+#define RYML_SINGLE_HDR_DEFINE_NOW
+#include <ryml_all.hpp>
+#ifndef _RYML_SINGLE_HEADER_AMALGAMATED_HPP_
+#define _RYML_SINGLE_HEADER_AMALGAMATED_HPP_
+#endif
+#undef RYML_SINGLE_HDR_DEFINE_NOW
+
+#include <NvPerfHudDataModel.h>
+#include <NvPerfHudTextRenderer.h>
+
+#include <NvPerfD3D11.h>
+#include <NvPerfD3D12.h>
+#include <NvPerfVulkan.h>
+#include <NvPerfMetricConfigurationsHAL.h>
+#include <NvPerfPeriodicSamplerGpu.h>
+#include <NvPerfPeriodicSamplerD3D12.h>
+#include <NvPerfPeriodicSamplerVulkan.h>
+#include <NvPerfCounterData.h>
+#include <NvPerfScopeExitGuard.h>
+
+#include <NvPerfMetricsEvaluator.h>
+#include <NvPerfMetricsConfigBuilder.h>
+#include <NvPerfCounterConfiguration.h>
+#include <NvPerfRangeProfilerD3D11.h>
+#include <NvPerfRangeProfilerD3D12.h>
+#include <NvPerfRangeProfilerVulkan.h>
+
+#include "nvperf_host_impl.h"
+
+#ifdef Rectangle
+#undef Rectangle
+#endif
+
+#include "Engine/Graphics/GPUAdapter.h"
+#include "Engine/Graphics/GPUContext.h"
+#include "Engine/Graphics/GPUDevice.h"
+#include "Engine/Graphics/Enums.h"
+
+#if GRAPHICS_API_VULKAN
+PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
+PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr = nullptr;
+PFN_vkDeviceWaitIdle vkDeviceWaitIdle = nullptr;
+PFN_vkQueueWaitIdle vkQueueWaitIdle = nullptr;
+#endif
+
+namespace
+{
+    using Microsoft::WRL::ComPtr;
+
+    static String RendererTypeToDisplayName(RendererType type)
+    {
+        switch (type)
+        {
+        case RendererType::DirectX11: return TEXT("DirectX 11");
+        case RendererType::DirectX12: return TEXT("DirectX 12");
+        case RendererType::Vulkan: return TEXT("Vulkan");
+        case RendererType::DirectX10: return TEXT("DirectX 10");
+        case RendererType::DirectX10_1: return TEXT("DirectX 10.1");
+        case RendererType::OpenGL4_1: return TEXT("OpenGL 4.1");
+        case RendererType::OpenGL4_4: return TEXT("OpenGL 4.4");
+        case RendererType::OpenGLES3: return TEXT("OpenGL ES 3");
+        case RendererType::OpenGLES3_1: return TEXT("OpenGL ES 3.1");
+        case RendererType::Null: return TEXT("Null");
+        case RendererType::WebGPU: return TEXT("WebGPU");
+        default: return TEXT("Unknown");
+        }
+    }
+
+    enum class PerfSdkBackend
+    {
+        D3D11,
+        D3D12,
+        Vulkan,
+    };
+
+    enum class ChipMetricFormat
+    {
+        Percent,
+        Warps,
+        Pixels,
+        Bandwidth,
+        Time,
+    };
+
+    static std::string ToUtf8Ascii(const String& s)
+    {
+        std::string result;
+        result.reserve((size_t)s.Length());
+        for (int32 i = 0; i < s.Length(); i++)
+        {
+            const Char c = s[i];
+            result.push_back(c < 128 ? static_cast<char>(c) : '?');
+        }
+        return result;
+    }
+
+    // Per-region metric (D3D11 Range Profiler). Each maps an NvPerf metric name to a display row.
+    struct RangeAreaDefinition
+    {
+        const Char* GroupName;
+        const Char* AreaName;
+        const char* MetricName;
+        const Char* MetricLabel;
+        ChipMetricFormat Format;
+        float BarScale;
+        bool HigherIsBetter;
+    };
+
+    static const RangeAreaDefinition gRangeAreaDefinitions[] =
+    {
+        // Overall GPU engine occupancy / SM pressure for the region.
+        { TEXT("GPU Engines"), TEXT("GPU Active"), "gr__cycles_active.avg.pct_of_peak_sustained_elapsed", TEXT("GPU Active"), ChipMetricFormat::Percent, 100.0f, false },
+        { TEXT("GPU Engines"), TEXT("SM Throughput"), "sm__throughput.avg.pct_of_peak_sustained_elapsed", TEXT("SM Throughput"), ChipMetricFormat::Percent, 100.0f, false },
+
+        // Graphics vs compute split by shader-domain warp occupancy (separate bars).
+        // VTG = vertex/tess/geometry (graphics front-end), PS = pixel (graphics back-end), CS = compute.
+        { TEXT("Workload"), TEXT("Vertex/Geo Warps"), "tpc__warps_active_shader_vtg.avg.pct_of_peak_sustained_elapsed", TEXT("Graphics (Vtx/Geo)"), ChipMetricFormat::Percent, 100.0f, false },
+        { TEXT("Workload"), TEXT("Pixel Warps"), "tpc__warps_active_shader_ps.avg.pct_of_peak_sustained_elapsed", TEXT("Graphics (Pixel)"), ChipMetricFormat::Percent, 100.0f, false },
+        { TEXT("Workload"), TEXT("Compute Warps"), "tpc__warps_active_shader_cs.avg.pct_of_peak_sustained_elapsed", TEXT("Compute"), ChipMetricFormat::Percent, 100.0f, false },
+
+        // Shader core detail. Occupancy tells you how well latency is hidden; pipe rows show the bound unit.
+        { TEXT("Shaders"), TEXT("SM Active"), "sm__cycles_active.avg.pct_of_peak_sustained_elapsed", TEXT("SM Active"), ChipMetricFormat::Percent, 100.0f, false },
+        { TEXT("Shaders"), TEXT("Occupancy"), "sm__warps_active.avg.pct_of_peak_sustained_elapsed", TEXT("Occupancy"), ChipMetricFormat::Percent, 100.0f, false },
+        { TEXT("Shaders"), TEXT("Issue Active"), "sm__issue_active.avg.pct_of_peak_sustained_elapsed", TEXT("Issue Active"), ChipMetricFormat::Percent, 100.0f, false },
+        { TEXT("Shaders"), TEXT("FMA Pipe"), "sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_elapsed", TEXT("FMA Active"), ChipMetricFormat::Percent, 100.0f, false },
+        { TEXT("Shaders"), TEXT("ALU Pipe"), "sm__pipe_alu_cycles_active.avg.pct_of_peak_sustained_elapsed", TEXT("ALU Active"), ChipMetricFormat::Percent, 100.0f, false },
+        { TEXT("Shaders"), TEXT("Tensor Pipe"), "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed", TEXT("Tensor Active"), ChipMetricFormat::Percent, 100.0f, false },
+        { TEXT("Shaders"), TEXT("LSU Pipe"), "sm__inst_executed_pipe_lsu.avg.pct_of_peak_sustained_elapsed", TEXT("LSU (Mem) Active"), ChipMetricFormat::Percent, 100.0f, false },
+        { TEXT("Shaders"), TEXT("Tex Pipe"), "sm__inst_executed_pipe_tex.avg.pct_of_peak_sustained_elapsed", TEXT("Tex Active"), ChipMetricFormat::Percent, 100.0f, false },
+
+        // Fixed-function graphics (only active during raster passes; idle for pure compute regions).
+        { TEXT("Raster (ROP)"), TEXT("Rasterizer"), "raster__throughput.avg.pct_of_peak_sustained_elapsed", TEXT("Rasterizer"), ChipMetricFormat::Percent, 100.0f, false },
+        { TEXT("Raster (ROP)"), TEXT("Color/Blend"), "crop__throughput.avg.pct_of_peak_sustained_elapsed", TEXT("Color ROP"), ChipMetricFormat::Percent, 100.0f, false },
+        { TEXT("Raster (ROP)"), TEXT("Depth"), "zrop__throughput.avg.pct_of_peak_sustained_elapsed", TEXT("Depth ROP"), ChipMetricFormat::Percent, 100.0f, false },
+
+        { TEXT("VRAM"), TEXT("DRAM Throughput"), "dram__throughput.avg.pct_of_peak_sustained_elapsed", TEXT("VRAM Throughput"), ChipMetricFormat::Percent, 100.0f, false },
+
+        // Cache pressure + hit rates. Low hit rate + high DRAM throughput = memory bound.
+        { TEXT("Caches"), TEXT("L2 Throughput"), "lts__throughput.avg.pct_of_peak_sustained_elapsed", TEXT("L2 Throughput"), ChipMetricFormat::Percent, 100.0f, false },
+        { TEXT("Caches"), TEXT("L2 Hit Rate"), "lts__t_sector_hit_rate.pct", TEXT("L2 Hit Rate"), ChipMetricFormat::Percent, 100.0f, true },
+        { TEXT("Caches"), TEXT("L1/TEX Throughput"), "l1tex__throughput.avg.pct_of_peak_sustained_elapsed", TEXT("L1/TEX Throughput"), ChipMetricFormat::Percent, 100.0f, false },
+        { TEXT("Caches"), TEXT("L1 Hit Rate"), "l1tex__t_sector_hit_rate.pct", TEXT("L1 Hit Rate"), ChipMetricFormat::Percent, 100.0f, true },
+
+        { TEXT("Timing"), TEXT("Region GPU Time"), "gpu__time_duration.sum", TEXT("GPU Time"), ChipMetricFormat::Time, 5.0f, false },
+    };
+
+    static const Char* gChipAreaGroupOrder[] =
+    {
+        TEXT("GPU Engines"),
+        TEXT("Workload"),
+        TEXT("Shaders"),
+        TEXT("Raster (ROP)"),
+        TEXT("VRAM"),
+        TEXT("Caches"),
+        TEXT("Timing"),
+    };
+
+    struct PerfSdkHudImpl
+    {
+        PerfSdkBackend backend = PerfSdkBackend::D3D11;
+
+        std::string chipName;
+
+        // ---- Range Profiler backends (true per-region; one active per backend) ----
+        // D3D11 is immediate-mode: BeginPass/PushRange/PopRange/EndPass happen inline during the region event.
+        // D3D12/Vulkan are deferred: queue-level BeginPass/EndPass bracket the frame (DrawBegin/DrawEnd),
+        // while command-list/command-buffer PushRange/PopRange mark the clicked region during recording.
+#if GRAPHICS_API_DIRECTX11
+        ComPtr<ID3D11Device> d3d11Device;
+        ComPtr<ID3D11DeviceContext> d3d11Context;
+        nv::perf::profiler::RangeProfilerD3D11 rangeProfilerD3D11;
+#endif
+#if GRAPHICS_API_DIRECTX12
+        ComPtr<ID3D12CommandQueue> d3d12Queue;
+        nv::perf::profiler::RangeProfilerD3D12 rangeProfilerD3D12;
+#endif
+#if GRAPHICS_API_VULKAN
+        nv::perf::profiler::RangeProfilerVulkan rangeProfilerVulkan;
+        VkInstance vkInstance = VK_NULL_HANDLE;
+        VkPhysicalDevice vkPhysicalDevice = VK_NULL_HANDLE;
+        VkDevice vkDevice = VK_NULL_HANDLE;
+        VkQueue vkQueue = VK_NULL_HANDLE;
+        uint32_t vkQueueFamilyIndex = 0;
+        nv::perf::ClockInfo vkSavedClockInfo = {};
+        bool vkClockSaved = false;
+#endif
+
+        // ---- Shared metrics evaluation (backend-agnostic once created) ----
+        std::unique_ptr<nv::perf::MetricsEvaluator> metricsEvaluator;
+        NVPW_MetricsEvaluator* metricsEvaluatorRaw = nullptr;
+        nv::perf::CounterConfiguration rangeCounterConfig;
+        std::vector<int32_t> activeRangeDefs;                  // indices into gRangeAreaDefinitions
+        std::vector<NVPW_MetricEvalRequest> rangeEvalRequests; // aligned with activeRangeDefs
+        std::vector<double> rangeMetricValues;                 // aligned with activeRangeDefs
+
+        bool rangeSessionActive = false;
+        bool rangeDataValid = false;
+        uint32_t rangeMeasurementCount = 0;
+        uint32_t rangePassesSubmitted = 0;
+        size_t rangePassesPerSample = 1;
+
+        // ---- Region selection ----
+        String targetRegionName;
+        std::string targetRegionNameUtf8;
+        int32 targetRegionDepth = -1;
+        int32 activeRegionEventIndex = -1;
+        bool regionRangePushed = false;   // a command-list range is currently open (deferred backends)
+        void* regionCmdPtr = nullptr;     // the exact command list/buffer the region range was pushed into (deferred backends)
+        bool regionProfilingActive = false;
+        uint32_t regionCompletionCount = 0;
+        uint32_t gpuFramesProcessed = 0;
+
+        // Deferred backends own the GPU queue from the render thread. BeginSession/EndSession must NOT run on
+        // the UI click thread. D3D12/Vulkan both start at OnFrameBegin (before any vkQueueSubmit), matching
+        // NvPerf ReportGeneratorVulkan::OnFrameStart. BeginSession after vkQueuePresentKHR fails with
+        // NVPA_STATUS_INVALID_CONTEXT_STATE because the present is still in flight. D3D11 is immediate-mode.
+        bool pendingSessionBegin = false;   // render thread should (re)start the range session
+        bool pendingSessionEnd = false;     // render thread should end the range session
+
+        // ---- Diagnostics (deferred backend stall investigation) ----
+        uint32_t dbgPassBeginCount = 0;     // queue-level BeginPass calls that succeeded
+        uint32_t dbgPassEndCount = 0;       // queue-level EndPass calls that succeeded
+        uint32_t dbgRangePushCount = 0;     // command-list PushRange calls that succeeded
+        uint32_t dbgDecodeCallCount = 0;    // DecodeCounters calls (poll)
+        bool dbgLoggedFirstPush = false;
+    };
+
+    // Forwards NvPerf's internal log messages (errors like "profiling permissions not enabled",
+    // "resource conflict", "insufficient driver version", etc.) into the Flax log so we can see
+    // the real reason BeginSession / BeginPass / Decode fails.
+    static void NvPerfLogToFlax(const char* pPrefix, const char* /*pDate*/, const char* /*pTime*/, const char* pFunctionName, const char* pMessage, void* /*pData*/)
+    {
+        const String prefix = pPrefix ? String(pPrefix) : String::Empty;
+        const String func = pFunctionName ? String(pFunctionName) : String::Empty;
+        String message = pMessage ? String(pMessage) : String::Empty;
+        message.Replace(TEXT("\n"), TEXT(" "));
+        message.Replace(TEXT("\r"), TEXT(" "));
+        const bool isError = prefix.Contains(TEXT("ERR")) || prefix.Contains(TEXT("err"));
+        if (isError)
+            LOG(Warning, "[NvPerf:{0}] {1} ({2})", prefix, message, func);
+        else
+            LOG(Info, "[NvPerf:{0}] {1}", prefix, message);
+    }
+
+    static const Char* BackendName(PerfSdkBackend backend)
+    {
+        switch (backend)
+        {
+        case PerfSdkBackend::D3D11:  return TEXT("D3D11");
+        case PerfSdkBackend::D3D12:  return TEXT("D3D12");
+        case PerfSdkBackend::Vulkan: return TEXT("Vulkan");
+        }
+        return TEXT("?");
+    }
+
+    static void LogVulkanEngineSetupHint()
+    {
+        String envPath;
+        const bool envInProcess = !Platform::GetEnvironmentVariable(TEXT("NVPERF_SDK_PATH"), envPath) && !envPath.IsEmpty();
+        LOG(Warning, "[PerfSDK] Vulkan Range Profiler requires a FULL FlaxEditor restart after engine/plugin changes. Startup log must include 'disabled all Vulkan layers', 'enabled N Vulkan device extension(s)', and 'Vulkan device configured for profiling (N NvPerf device extension(s))'. NVPERF_SDK_PATH in this process={0}.", envInProcess ? 1 : 0);
+    }
+
+    static bool TrySetNvPerfLibraryPath()
+    {
+        std::vector<std::wstring> candidates;
+        wchar_t envPath[1024];
+        if (GetEnvironmentVariableW(L"NVPERF_SDK_PATH", envPath, 1024) > 0)
+            candidates.emplace_back(envPath);
+
+        for (const std::wstring& root : candidates)
+        {
+            const std::wstring binPath = root + L"\\NvPerf\\bin\\x64";
+            if (GetFileAttributesW(binPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+                continue;
+
+            const wchar_t* paths[] = { binPath.c_str() };
+            NVPW_SetLibraryLoadPathsW_Params params = { NVPW_SetLibraryLoadPathsW_Params_STRUCT_SIZE };
+            params.numPaths = 1;
+            params.ppwPaths = paths;
+            if (NVPW_SetLibraryLoadPathsW(&params) == NVPA_STATUS_SUCCESS)
+                return true;
+        }
+        return true;
+    }
+
+    static bool MatchesTargetRegion(const PerfSdkHudImpl& impl, const Char* name, int32 depth)
+    {
+        if (!impl.regionProfilingActive || impl.targetRegionName.IsEmpty() || !name)
+            return false;
+        if (depth != impl.targetRegionDepth)
+            return false;
+        return StringUtils::CompareIgnoreCase(impl.targetRegionName.Get(), name) == 0;
+    }
+
+    static float NormalizeMetricPercent(double value)
+    {
+        if (std::isnan(value) || std::isinf(value))
+            return 0.0f;
+        return static_cast<float>(Math::Clamp(value, 0.0, 100.0));
+    }
+
+    // ===================== Display formatting (shared) =====================
+
+    static float ComputeBarValue(ChipMetricFormat format, float barScale, double rawValue)
+    {
+        if (std::isnan(rawValue) || std::isinf(rawValue))
+            return 0.0f;
+
+        switch (format)
+        {
+        case ChipMetricFormat::Percent:
+            return NormalizeMetricPercent(rawValue);
+        case ChipMetricFormat::Time:
+        {
+            const double ms = rawValue / 1.0e6;
+            if (barScale <= 0.0f)
+                return 0.0f;
+            return NormalizeMetricPercent(ms / barScale * 100.0);
+        }
+        default:
+            if (barScale <= 0.0f)
+                return 0.0f;
+            return NormalizeMetricPercent(rawValue / barScale * 100.0);
+        }
+    }
+
+    static String FormatMetricDetail(const Char* label, ChipMetricFormat format, double rawValue)
+    {
+        switch (format)
+        {
+        case ChipMetricFormat::Percent:
+            return String::Format(TEXT("{0}: {1:.1f}%"), label, (float)rawValue);
+        case ChipMetricFormat::Warps:
+            return String::Format(TEXT("{0}: {1:.1f} warps"), label, (float)rawValue);
+        case ChipMetricFormat::Pixels:
+            return String::Format(TEXT("{0}: {1:.0f}"), label, (float)rawValue);
+        case ChipMetricFormat::Bandwidth:
+            return String::Format(TEXT("{0}: {1:.2f} GB/s"), label, (float)rawValue);
+        case ChipMetricFormat::Time:
+            return String::Format(TEXT("{0}: {1:.4f} ms"), label, (float)(rawValue / 1.0e6));
+        default:
+            return String::Format(TEXT("{0}: {1:.1f}"), label, (float)rawValue);
+        }
+    }
+
+    // ===================== Range Profiler (per-region, all backends) =====================
+
+    // Only one backend's range profiler is active per session; these dispatch to it.
+    static bool RangeIsInPass(PerfSdkHudImpl& impl)
+    {
+        switch (impl.backend)
+        {
+#if GRAPHICS_API_DIRECTX11
+        case PerfSdkBackend::D3D11:  return impl.rangeProfilerD3D11.IsInPass();
+#endif
+#if GRAPHICS_API_DIRECTX12
+        case PerfSdkBackend::D3D12:  return impl.rangeProfilerD3D12.IsInPass();
+#endif
+#if GRAPHICS_API_VULKAN
+        case PerfSdkBackend::Vulkan: return impl.rangeProfilerVulkan.IsInPass();
+#endif
+        }
+        return false;
+    }
+
+    // True once every pass the current counter configuration needs has been submitted.
+    // The Range Profiler state machine expects no further BeginPass/EndPass until the
+    // collected counters are decoded; starting extra passes prevents the decode from
+    // ever reporting allStatisticalSamplesCollected (i.e. "forever collecting").
+    static bool RangeAllPassesSubmitted(PerfSdkHudImpl& impl)
+    {
+        switch (impl.backend)
+        {
+#if GRAPHICS_API_DIRECTX11
+        case PerfSdkBackend::D3D11:  return impl.rangeProfilerD3D11.AllPassesSubmitted();
+#endif
+#if GRAPHICS_API_DIRECTX12
+        case PerfSdkBackend::D3D12:  return impl.rangeProfilerD3D12.AllPassesSubmitted();
+#endif
+#if GRAPHICS_API_VULKAN
+        case PerfSdkBackend::Vulkan: return impl.rangeProfilerVulkan.AllPassesSubmitted();
+#endif
+        }
+        return false;
+    }
+
+    static bool RangeBeginPass(PerfSdkHudImpl& impl)
+    {
+        switch (impl.backend)
+        {
+#if GRAPHICS_API_DIRECTX11
+        case PerfSdkBackend::D3D11:  return impl.rangeProfilerD3D11.BeginPass();
+#endif
+#if GRAPHICS_API_DIRECTX12
+        case PerfSdkBackend::D3D12:  return impl.rangeProfilerD3D12.BeginPass();
+#endif
+#if GRAPHICS_API_VULKAN
+        case PerfSdkBackend::Vulkan: return impl.rangeProfilerVulkan.BeginPass();
+#endif
+        }
+        return false;
+    }
+
+    static bool RangeEndPass(PerfSdkHudImpl& impl)
+    {
+        switch (impl.backend)
+        {
+#if GRAPHICS_API_DIRECTX11
+        case PerfSdkBackend::D3D11:  return impl.rangeProfilerD3D11.EndPass();
+#endif
+#if GRAPHICS_API_DIRECTX12
+        case PerfSdkBackend::D3D12:  return impl.rangeProfilerD3D12.EndPass();
+#endif
+#if GRAPHICS_API_VULKAN
+        case PerfSdkBackend::Vulkan: return impl.rangeProfilerVulkan.EndPass();
+#endif
+        }
+        return false;
+    }
+
+    static bool RangeEnqueue(PerfSdkHudImpl& impl)
+    {
+        switch (impl.backend)
+        {
+#if GRAPHICS_API_DIRECTX11
+        case PerfSdkBackend::D3D11:  return impl.rangeProfilerD3D11.EnqueueCounterCollection(impl.rangeCounterConfig, 1, 1);
+#endif
+#if GRAPHICS_API_DIRECTX12
+        case PerfSdkBackend::D3D12:  return impl.rangeProfilerD3D12.EnqueueCounterCollection(impl.rangeCounterConfig, 1, 1);
+#endif
+#if GRAPHICS_API_VULKAN
+        case PerfSdkBackend::Vulkan: return impl.rangeProfilerVulkan.EnqueueCounterCollection(impl.rangeCounterConfig, 1, 1);
+#endif
+        }
+        return false;
+    }
+
+    static bool RangeDecode(PerfSdkHudImpl& impl, nv::perf::profiler::DecodeResult& result)
+    {
+        switch (impl.backend)
+        {
+#if GRAPHICS_API_DIRECTX11
+        case PerfSdkBackend::D3D11:  return impl.rangeProfilerD3D11.DecodeCounters(result);
+#endif
+#if GRAPHICS_API_DIRECTX12
+        case PerfSdkBackend::D3D12:  return impl.rangeProfilerD3D12.DecodeCounters(result);
+#endif
+#if GRAPHICS_API_VULKAN
+        case PerfSdkBackend::Vulkan: return impl.rangeProfilerVulkan.DecodeCounters(result);
+#endif
+        }
+        return false;
+    }
+
+    // Builds the metrics evaluator + counter configuration (shared logic; backend only changes the factory calls).
+    static bool InitRangeMetrics(PerfSdkHudImpl& impl, String& statusText)
+    {
+        const char* chip = impl.chipName.c_str();
+
+        size_t scratchBufferSize = 0;
+        switch (impl.backend)
+        {
+#if GRAPHICS_API_DIRECTX11
+        case PerfSdkBackend::D3D11:  scratchBufferSize = nv::perf::D3D11CalculateMetricsEvaluatorScratchBufferSize(chip); break;
+#endif
+#if GRAPHICS_API_DIRECTX12
+        case PerfSdkBackend::D3D12:  scratchBufferSize = nv::perf::D3D12CalculateMetricsEvaluatorScratchBufferSize(chip); break;
+#endif
+#if GRAPHICS_API_VULKAN
+        case PerfSdkBackend::Vulkan: scratchBufferSize = nv::perf::VulkanCalculateMetricsEvaluatorScratchBufferSize(chip); break;
+#endif
+        }
+        if (scratchBufferSize == 0)
+        {
+            statusText = TEXT("Nsight Perf: metrics evaluator scratch size failed.");
+            return false;
+        }
+
+        std::vector<uint8_t> scratchBuffer(scratchBufferSize);
+        NVPW_MetricsEvaluator* pMetricsEvaluator = nullptr;
+        switch (impl.backend)
+        {
+#if GRAPHICS_API_DIRECTX11
+        case PerfSdkBackend::D3D11:  pMetricsEvaluator = nv::perf::D3D11CreateMetricsEvaluator(scratchBuffer.data(), scratchBuffer.size(), chip); break;
+#endif
+#if GRAPHICS_API_DIRECTX12
+        case PerfSdkBackend::D3D12:  pMetricsEvaluator = nv::perf::D3D12CreateMetricsEvaluator(scratchBuffer.data(), scratchBuffer.size(), chip); break;
+#endif
+#if GRAPHICS_API_VULKAN
+        case PerfSdkBackend::Vulkan: pMetricsEvaluator = nv::perf::VulkanCreateMetricsEvaluator(scratchBuffer.data(), scratchBuffer.size(), chip); break;
+#endif
+        }
+        if (!pMetricsEvaluator)
+        {
+            statusText = TEXT("Nsight Perf: CreateMetricsEvaluator failed.");
+            return false;
+        }
+        impl.metricsEvaluator = std::make_unique<nv::perf::MetricsEvaluator>(pMetricsEvaluator, std::move(scratchBuffer));
+        impl.metricsEvaluatorRaw = pMetricsEvaluator;
+
+        NVPW_RawCounterConfig* pRawCounterConfig = nullptr;
+        switch (impl.backend)
+        {
+#if GRAPHICS_API_DIRECTX11
+        case PerfSdkBackend::D3D11:  pRawCounterConfig = nv::perf::profiler::D3D11CreateRawCounterConfig(chip); break;
+#endif
+#if GRAPHICS_API_DIRECTX12
+        case PerfSdkBackend::D3D12:  pRawCounterConfig = nv::perf::profiler::D3D12CreateRawCounterConfig(chip); break;
+#endif
+#if GRAPHICS_API_VULKAN
+        case PerfSdkBackend::Vulkan: pRawCounterConfig = nv::perf::profiler::VulkanCreateRawCounterConfig(chip); break;
+#endif
+        }
+        if (!pRawCounterConfig)
+        {
+            statusText = TEXT("Nsight Perf: CreateRawCounterConfig failed.");
+            return false;
+        }
+
+        nv::perf::MetricsConfigBuilder configBuilder;
+        if (!configBuilder.Initialize(pMetricsEvaluator, pRawCounterConfig, chip))
+        {
+            statusText = TEXT("Nsight Perf: MetricsConfigBuilder init failed.");
+            return false;
+        }
+
+        // Add only metrics that exist on this chip, keeping defs/requests aligned.
+        impl.activeRangeDefs.clear();
+        impl.rangeEvalRequests.clear();
+        for (int32_t i = 0; i < (int32_t)(sizeof(gRangeAreaDefinitions) / sizeof(gRangeAreaDefinitions[0])); i++)
+        {
+            NVPW_MetricEvalRequest request{};
+            if (!nv::perf::ToMetricEvalRequest(pMetricsEvaluator, gRangeAreaDefinitions[i].MetricName, request))
+                continue;
+            if (!configBuilder.AddMetric(gRangeAreaDefinitions[i].MetricName))
+                continue;
+            impl.activeRangeDefs.push_back(i);
+            impl.rangeEvalRequests.push_back(request);
+        }
+        if (impl.activeRangeDefs.empty())
+        {
+            statusText = TEXT("Nsight Perf: no supported range metrics on this GPU.");
+            return false;
+        }
+
+        if (!nv::perf::CreateConfiguration(configBuilder, impl.rangeCounterConfig))
+        {
+            statusText = TEXT("Nsight Perf: range counter configuration failed.");
+            return false;
+        }
+        impl.rangePassesPerSample = impl.rangeCounterConfig.numPasses > 0 ? impl.rangeCounterConfig.numPasses : 1;
+        impl.rangeMetricValues.assign(impl.activeRangeDefs.size(), 0.0);
+        return true;
+    }
+
+#if GRAPHICS_API_DIRECTX11
+    static bool InitRangeProfilerD3D11(PerfSdkHudImpl& impl, ID3D11Device* device, ID3D11DeviceContext* context, String& statusText)
+    {
+        if (!device || !context || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+        {
+            statusText = TEXT("Nsight Perf: D3D11 immediate context required.");
+            return false;
+        }
+        if (!nv::perf::D3D11LoadDriver())
+        {
+            statusText = TEXT("Nsight Perf: D3D11LoadDriver failed.");
+            return false;
+        }
+        if (!nv::perf::D3D11IsNvidiaDevice(device) || !nv::perf::profiler::D3D11IsGpuSupported(device))
+        {
+            statusText = TEXT("Nsight Perf: D3D11 NVIDIA GPU not supported for profiling.");
+            return false;
+        }
+        const nv::perf::DeviceIdentifiers deviceIdentifiers = nv::perf::D3D11GetDeviceIdentifiers(device);
+        if (!deviceIdentifiers.pChipName)
+        {
+            statusText = TEXT("Nsight Perf: unknown GPU chip.");
+            return false;
+        }
+        impl.chipName = deviceIdentifiers.pChipName;
+        impl.d3d11Device = device;
+        impl.d3d11Context = context;
+        return InitRangeMetrics(impl, statusText);
+    }
+#endif
+#if GRAPHICS_API_DIRECTX12
+    static bool InitRangeProfilerD3D12(PerfSdkHudImpl& impl, GPUDevice* gpuDevice, String& statusText)
+    {
+        if (!gpuDevice)
+        {
+            statusText = TEXT("Nsight Perf: missing D3D12 device.");
+            return false;
+        }
+        if (Engine::GetCommandLine().Contains(TEXT("-gpudebug")))
+        {
+            statusText = TEXT("Nsight Perf: cannot use Vulkan device with Debug Layer enabled. Run without '-gpudebug' command line.");
+            return false;
+        }
+        auto* device = static_cast<ID3D12Device*>(gpuDevice->GetNativePtr());
+        if (!device)
+        {
+            statusText = TEXT("Nsight Perf: missing D3D12 native device.");
+            return false;
+        }
+        if (!nv::perf::D3D12LoadDriver())
+        {
+            statusText = TEXT("Nsight Perf: D3D12LoadDriver failed.");
+            return false;
+        }
+        if (!nv::perf::D3D12IsNvidiaDevice(device) || !nv::perf::profiler::D3D12IsGpuSupported(device))
+        {
+            statusText = TEXT("Nsight Perf: D3D12 NVIDIA GPU not supported.");
+            return false;
+        }
+        auto* queue = static_cast<ID3D12CommandQueue*>(gpuDevice->GetNativeQueue().MainQueue);
+        if (!queue)
+        {
+            statusText = TEXT("Nsight Perf: D3D12 graphics queue not found.");
+            return false;
+        }
+        const nv::perf::DeviceIdentifiers deviceIdentifiers = nv::perf::D3D12GetDeviceIdentifiers(device);
+        if (!deviceIdentifiers.pChipName)
+        {
+            statusText = TEXT("Nsight Perf: unknown GPU chip.");
+            return false;
+        }
+        impl.chipName = deviceIdentifiers.pChipName;
+        impl.d3d12Queue = queue;
+        return InitRangeMetrics(impl, statusText);
+    }
+#endif
+#if GRAPHICS_API_VULKAN
+    static bool InitRangeProfilerVulkan(PerfSdkHudImpl& impl, GPUDevice* gpuDevice, GPUAdapter* adapter, String& statusText)
+    {
+        if (!gpuDevice || !adapter)
+        {
+            statusText = TEXT("Nsight Perf: missing Vulkan device or adapter.");
+            return false;
+        }
+        if (Engine::GetCommandLine().Contains(TEXT("-gpudebug")))
+        {
+            statusText = TEXT("Nsight Perf: cannot use Vulkan device with Debug Layer enabled. Run without '-gpudebug' command line.");
+            return false;
+        }
+        void** handles = static_cast<void**>(gpuDevice->GetNativePtr());
+        VkInstance instance = handles ? static_cast<VkInstance>(handles[0]) : VK_NULL_HANDLE;
+        VkDevice device = handles ? static_cast<VkDevice>(handles[1]) : VK_NULL_HANDLE;
+        VkPhysicalDevice physicalDevice = static_cast<VkPhysicalDevice>(adapter->GetNativePtr());
+        if (!instance || !physicalDevice || !device)
+        {
+            statusText = TEXT("Nsight Perf: missing Vulkan handles.");
+            return false;
+        }
+        vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)handles[2]; // GPUDeviceVulkan::GetNativePtr
+        vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)handles[3]; // GPUDeviceVulkan::GetNativePtr
+        vkDeviceWaitIdle = (PFN_vkDeviceWaitIdle)vkGetDeviceProcAddr(device, "vkDeviceWaitIdle");
+        vkQueueWaitIdle = (PFN_vkQueueWaitIdle)vkGetDeviceProcAddr(device, "vkQueueWaitIdle");
+        if (!nv::perf::VulkanLoadDriver(instance))
+        {
+            statusText = TEXT("Nsight Perf: VulkanLoadDriver failed.");
+            return false;
+        }
+        if (!adapter->IsNVIDIA())
+        {
+            statusText = TEXT("Nsight Perf: Vulkan NVIDIA GPU not supported.");
+            return false;
+        }
+        auto queueInfo = gpuDevice->GetNativeQueue();
+        VkQueue queue = static_cast<VkQueue>(queueInfo.MainQueue);
+        const uint32_t queueFamilyIndex = queueInfo.MainQueueFamilyIndex;
+        if (!queue)
+        {
+            statusText = TEXT("Nsight Perf: Vulkan graphics queue not found.");
+            return false;
+        }
+        impl.vkInstance = instance;
+        impl.vkPhysicalDevice = physicalDevice;
+        impl.vkDevice = device;
+        impl.vkQueue = queue;
+        impl.vkQueueFamilyIndex = queueFamilyIndex;
+        const nv::perf::DeviceIdentifiers deviceIdentifiers = nv::perf::VulkanGetDeviceIdentifiers(instance, physicalDevice, device, vkGetInstanceProcAddr, vkGetDeviceProcAddr);
+        if (!deviceIdentifiers.pChipName)
+        {
+            statusText = TEXT("Nsight Perf: unknown GPU chip.");
+            return false;
+        }
+        impl.chipName = deviceIdentifiers.pChipName;
+        impl.vkSavedClockInfo = nv::perf::VulkanGetDeviceClockState(instance, physicalDevice, device, vkGetInstanceProcAddr, vkGetDeviceProcAddr);
+        impl.vkClockSaved = nv::perf::VulkanSetDeviceClockState(instance, physicalDevice, device, NVPW_DEVICE_CLOCK_SETTING_LOCK_TO_RATED_TDP, vkGetInstanceProcAddr, vkGetDeviceProcAddr);
+        return InitRangeMetrics(impl, statusText);
+    }
+#endif
+
+    static void EndRangeSession(PerfSdkHudImpl& impl)
+    {
+        if (!impl.rangeSessionActive)
+            return;
+        switch (impl.backend)
+        {
+#if GRAPHICS_API_DIRECTX11
+        case PerfSdkBackend::D3D11:
+            if (impl.d3d11Device && impl.d3d11Context)
+                nv::perf::D3D11Finish(impl.d3d11Device.Get(), impl.d3d11Context.Get());
+            impl.rangeProfilerD3D11.EndSession();
+            break;
+#endif
+#if GRAPHICS_API_DIRECTX12
+        case PerfSdkBackend::D3D12:
+            impl.rangeProfilerD3D12.EndSession();
+            break;
+#endif
+#if GRAPHICS_API_VULKAN
+        case PerfSdkBackend::Vulkan:
+            impl.rangeProfilerVulkan.EndSession();
+            break;
+#endif
+        }
+        impl.rangeSessionActive = false;
+        impl.regionRangePushed = false;
+        impl.activeRegionEventIndex = -1;
+        impl.rangePassesSubmitted = 0;
+    }
+
+#if GRAPHICS_API_DIRECTX12
+    // Replicates the wrapper's low-level NVPW BeginSession calls to capture the exact NVPA_Status that the
+    // RangeProfilerD3D12 wrapper hides behind "unknown error". Only invoked after the wrapper already failed.
+    static void DiagnoseD3D12BeginSession(PerfSdkHudImpl& impl)
+    {
+        if (!impl.d3d12Queue)
+        {
+            LOG(Warning, "[PerfSDK][diag] D3D12 queue is null; cannot probe BeginSession.");
+            return;
+        }
+
+        NVPW_D3D12_Profiler_CalcTraceBufferSize_Params calc = { NVPW_D3D12_Profiler_CalcTraceBufferSize_Params_STRUCT_SIZE };
+        calc.maxRangesPerPass = 16;
+        calc.avgRangeNameLength = 128;
+        NVPA_Status st = NVPW_D3D12_Profiler_CalcTraceBufferSize(&calc);
+        LOG(Warning, "[PerfSDK][diag] CalcTraceBufferSize -> {0} (traceBufferSize={1}).",
+            String(nv::perf::FormatStatus(st).c_str()), (int32)calc.traceBufferSize);
+        if (st != NVPA_STATUS_SUCCESS)
+            return;
+
+        NVPW_D3D12_Profiler_Queue_BeginSession_Params bs = { NVPW_D3D12_Profiler_Queue_BeginSession_Params_STRUCT_SIZE };
+        bs.pCommandQueue = impl.d3d12Queue.Get();
+        bs.numTraceBuffers = 5;
+        bs.traceBufferSize = calc.traceBufferSize;
+        bs.maxRangesPerPass = 16;
+        bs.maxLaunchesPerPass = 16;
+        st = NVPW_D3D12_Profiler_Queue_BeginSession(&bs);
+        LOG(Warning, "[PerfSDK][diag] NVPW_D3D12_Profiler_Queue_BeginSession -> {0}.", String(nv::perf::FormatStatus(st).c_str()));
+        if (st == NVPA_STATUS_SUCCESS)
+        {
+            NVPW_D3D12_Profiler_Queue_EndSession_Params es = { NVPW_D3D12_Profiler_Queue_EndSession_Params_STRUCT_SIZE };
+            es.pCommandQueue = impl.d3d12Queue.Get();
+            es.timeout = 0xFFFFFFFF;
+            NVPW_D3D12_Profiler_Queue_EndSession(&es);
+        }
+    }
+#endif
+#if GRAPHICS_API_VULKAN
+    // Vulkan analog of DiagnoseD3D12BeginSession: replicates RangeProfilerVulkan::BeginSession's low-level NVPW
+    // calls so we can capture the exact NVPA_Status the wrapper hides behind "unknown error".
+    static void DiagnoseVulkanBeginSession(PerfSdkHudImpl& impl)
+    {
+        if (!impl.vkQueue || !impl.vkInstance || !impl.vkPhysicalDevice || !impl.vkDevice)
+        {
+            LOG(Warning, "[PerfSDK][diag] Vulkan handles null; cannot probe BeginSession.");
+            return;
+        }
+
+        const bool nvidia = nv::perf::VulkanIsNvidiaDevice(impl.vkPhysicalDevice, impl.vkInstance, vkGetInstanceProcAddr);
+        const bool supported = nvidia && nv::perf::profiler::VulkanIsGpuSupported(impl.vkInstance, impl.vkPhysicalDevice, impl.vkDevice, vkGetInstanceProcAddr, vkGetDeviceProcAddr);
+        LOG(Warning, "[PerfSDK][diag] Vulkan IsNvidiaDevice={0} IsGpuSupported={1}.", nvidia ? 1 : 0, supported ? 1 : 0);
+        if (!supported)
+            return;
+
+        NVPW_VK_Profiler_CalcTraceBufferSize_Params calc = { NVPW_VK_Profiler_CalcTraceBufferSize_Params_STRUCT_SIZE };
+        calc.maxRangesPerPass = 16;
+        calc.avgRangeNameLength = 128;
+        NVPA_Status st = NVPW_VK_Profiler_CalcTraceBufferSize(&calc);
+        LOG(Warning, "[PerfSDK][diag] NVPW_VK_Profiler_CalcTraceBufferSize -> {0} (traceBufferSize={1}).",
+            String(nv::perf::FormatStatus(st).c_str()), (int32)calc.traceBufferSize);
+        if (st != NVPA_STATUS_SUCCESS)
+            return;
+
+        NVPW_VK_Profiler_Queue_BeginSession_Params bs = { NVPW_VK_Profiler_Queue_BeginSession_Params_STRUCT_SIZE };
+        bs.instance = impl.vkInstance;
+        bs.physicalDevice = impl.vkPhysicalDevice;
+        bs.device = impl.vkDevice;
+        bs.queue = impl.vkQueue;
+        bs.pfnGetInstanceProcAddr = (void*)vkGetInstanceProcAddr;
+        bs.pfnGetDeviceProcAddr = (void*)vkGetDeviceProcAddr;
+        bs.numTraceBuffers = 5;
+        bs.traceBufferSize = calc.traceBufferSize;
+        bs.maxRangesPerPass = 16;
+        bs.maxLaunchesPerPass = 16;
+        st = NVPW_VK_Profiler_Queue_BeginSession(&bs);
+        LOG(Warning, "[PerfSDK][diag] NVPW_VK_Profiler_Queue_BeginSession -> {0}.", String(nv::perf::FormatStatus(st).c_str()));
+        if (st == NVPA_STATUS_SUCCESS)
+        {
+            NVPW_VK_Profiler_Queue_EndSession_Params es = { NVPW_VK_Profiler_Queue_EndSession_Params_STRUCT_SIZE };
+            es.queue = impl.vkQueue;
+            es.timeout = 0xFFFFFFFF;
+            NVPW_VK_Profiler_Queue_EndSession(&es);
+        }
+    }
+#endif
+
+    static bool BeginRangeSession(PerfSdkHudImpl& impl)
+    {
+        EndRangeSession(impl);
+
+        // D3D12/Vulkan: the queue-based NVPW BeginSession returns NVPA_STATUS_INVALID_CONTEXT_STATE when the
+        // command queue still has GPU work in flight (Flax has been rendering for many frames, unlike the
+        // reference samples that begin on a pristine queue). Idle the GPU so the queue is at a clean point
+        // before the profiler takes it over. Safe here because BeginRangeSession runs on the render thread.
+        if (impl.backend != PerfSdkBackend::D3D11 && GPUDevice::Instance)
+            GPUDevice::Instance->WaitForGPU();
+
+        nv::perf::profiler::SessionOptions sessionOptions;
+        sessionOptions.maxNumRanges = 16;
+        sessionOptions.numTraceBuffers = 5;
+
+        bool began = false;
+        switch (impl.backend)
+        {
+#if GRAPHICS_API_DIRECTX11
+        case PerfSdkBackend::D3D11:
+            if (impl.d3d11Context)
+                began = impl.rangeProfilerD3D11.BeginSession(impl.d3d11Context.Get(), sessionOptions);
+            break;
+#endif
+#if GRAPHICS_API_DIRECTX12
+        case PerfSdkBackend::D3D12:
+            if (impl.d3d12Queue)
+                began = impl.rangeProfilerD3D12.BeginSession(impl.d3d12Queue.Get(), sessionOptions);
+            break;
+#endif
+#if GRAPHICS_API_VULKAN
+        case PerfSdkBackend::Vulkan:
+            if (impl.vkQueue)
+            {
+                // Re-bind NvPerf driver hooks and drain the queue before NvPerf takes it over (NVIDIA samples
+                // call OnFrameStart/BeginSession at frame start, before submit; never after present).
+                if (!nv::perf::VulkanLoadDriver(impl.vkInstance))
+                    LOG(Warning, "[PerfSDK] VulkanLoadDriver failed before BeginSession.");
+                if (impl.vkDevice)
+                    vkDeviceWaitIdle(impl.vkDevice);
+                vkQueueWaitIdle(impl.vkQueue);
+                began = impl.rangeProfilerVulkan.BeginSession(impl.vkInstance, impl.vkPhysicalDevice, impl.vkDevice, impl.vkQueue, impl.vkQueueFamilyIndex, sessionOptions, vkGetInstanceProcAddr, vkGetDeviceProcAddr);
+            }
+            break;
+#endif
+        }
+        if (!began)
+        {
+            LOG(Warning, "[PerfSDK] BeginRangeSession FAILED ({0}).", BackendName(impl.backend));
+#if GRAPHICS_API_DIRECTX12
+            if (impl.backend == PerfSdkBackend::D3D12)
+                DiagnoseD3D12BeginSession(impl);
+#endif
+#if GRAPHICS_API_VULKAN
+        	if (impl.backend == PerfSdkBackend::Vulkan)
+            {
+                DiagnoseVulkanBeginSession(impl);
+                LogVulkanEngineSetupHint();
+            }
+#endif
+            return false;
+        }
+
+        impl.dbgPassBeginCount = 0;
+        impl.dbgPassEndCount = 0;
+        impl.dbgRangePushCount = 0;
+        impl.dbgDecodeCallCount = 0;
+        impl.dbgLoggedFirstPush = false;
+        LOG(Info, "[PerfSDK] BeginRangeSession OK ({0}) passesPerSample={1} metrics={2}.",
+            BackendName(impl.backend), (int32)impl.rangePassesPerSample, (int32)impl.activeRangeDefs.size());
+
+        impl.rangeSessionActive = true;
+        impl.regionRangePushed = false;
+        impl.activeRegionEventIndex = -1;
+        impl.rangePassesSubmitted = 0;
+        impl.rangeDataValid = false;
+
+        // Queue the first measurement cycle.
+        if (!RangeEnqueue(impl))
+        {
+            EndRangeSession(impl);
+            return false;
+        }
+        return true;
+    }
+
+    static void EvaluateRange(PerfSdkHudImpl& impl, const std::vector<uint8_t>& counterDataImage)
+    {
+        if (counterDataImage.empty() || impl.rangeEvalRequests.empty() || !impl.metricsEvaluatorRaw)
+            return;
+
+        const uint8_t* image = counterDataImage.data();
+        const size_t imageSize = counterDataImage.size();
+        if (!nv::perf::MetricsEvaluatorSetDeviceAttributes(impl.metricsEvaluatorRaw, image, imageSize))
+            return;
+
+        const size_t numRanges = nv::perf::CounterDataGetNumRanges(image);
+        if (numRanges == 0)
+            return;
+
+        // We push a single range per pass, so range 0 holds the clicked region.
+        std::vector<double> values(impl.rangeEvalRequests.size(), 0.0);
+        if (!nv::perf::EvaluateToGpuValues(
+                impl.metricsEvaluatorRaw,
+                image,
+                imageSize,
+                0,
+                impl.rangeEvalRequests.size(),
+                impl.rangeEvalRequests.data(),
+                values.data()))
+            return;
+
+        impl.rangeMetricValues = std::move(values);
+        impl.rangeDataValid = true;
+        impl.rangeMeasurementCount++;
+    }
+
+    static void RangeDecodeAtFrameEnd(PerfSdkHudImpl& impl)
+    {
+        if (!impl.rangeSessionActive)
+            return;
+        if (RangeIsInPass(impl)) // never decode mid-pass
+            return;
+
+        nv::perf::profiler::DecodeResult decodeResult = {};
+        if (!RangeDecode(impl, decodeResult))
+        {
+            // Session is unusable after a decode failure: restart it cleanly.
+            LOG(Warning, "[PerfSDK] DecodeCounters returned FALSE ({0}); restarting session. passBegin={1} passEnd={2} push={3}.",
+                BackendName(impl.backend), impl.dbgPassBeginCount, impl.dbgPassEndCount, impl.dbgRangePushCount);
+            BeginRangeSession(impl);
+            return;
+        }
+
+        impl.dbgDecodeCallCount++;
+        const size_t numRanges = decodeResult.counterDataImage.empty() ? 0 : nv::perf::CounterDataGetNumRanges(decodeResult.counterDataImage.data());
+        // Throttle: log first few polls + every 60th, so we see progress without flooding.
+        if (impl.dbgDecodeCallCount <= 5 || (impl.dbgDecodeCallCount % 60) == 0)
+        {
+            LOG(Info, "[PerfSDK] Decode#{0} ({1}) allSamples={2} imageBytes={3} numRanges={4} passEnd={5} push={6}.",
+                impl.dbgDecodeCallCount, BackendName(impl.backend),
+                decodeResult.allStatisticalSamplesCollected ? 1 : 0,
+                (int32)decodeResult.counterDataImage.size(), (int32)numRanges,
+                impl.dbgPassEndCount, impl.dbgRangePushCount);
+        }
+
+        if (decodeResult.allStatisticalSamplesCollected && !decodeResult.counterDataImage.empty())
+        {
+            const bool wasValid = impl.rangeDataValid;
+            EvaluateRange(impl, decodeResult.counterDataImage);
+            if (!wasValid)
+                LOG(Info, "[PerfSDK] Samples complete ({0}): numRanges={1} -> dataValid={2}.",
+                    BackendName(impl.backend), (int32)numRanges, impl.rangeDataValid ? 1 : 0);
+            impl.rangePassesSubmitted = 0;
+            // Arm the next measurement cycle so the next region begin has a config.
+            RangeEnqueue(impl);
+        }
+    }
+
+}
+
+bool PerfSdkHud::TryInitialize(GPUDevice* device, GPUAdapter* adapter, GPUContext* context)
+{
+    Shutdown();
+
+    if (!device || !context)
+    {
+        _statusText = TEXT("Nsight Perf: missing GPU device or context.");
+        return false;
+    }
+
+    const RendererType rendererType = device->GetRendererType();
+    _graphicsApiName = RendererTypeToDisplayName(rendererType);
+
+    if (rendererType != RendererType::DirectX11 &&
+        rendererType != RendererType::DirectX12 &&
+        rendererType != RendererType::Vulkan)
+    {
+        _statusText = String::Format(TEXT("Nsight Perf: unsupported graphics API ({0}). Use D3D11, D3D12, or Vulkan."), _graphicsApiName);
+        return false;
+    }
+
+    TrySetNvPerfLibraryPath();
+    if (!nv::perf::InitializeNvPerf())
+    {
+        _statusText = TEXT("Nsight Perf: NVPW_InitializeHost/Target failed.");
+        return false;
+    }
+
+    // Surface NvPerf's own diagnostics (privilege/driver/resource errors) in the Flax log, at max verbosity.
+    nv::perf::UserLogEnableCustom(NvPerfLogToFlax, nullptr);
+    nv::perf::SetLogVolumeLevel(nv::perf::LogSeverity::Err, 100);
+    nv::perf::SetLogVolumeLevel(nv::perf::LogSeverity::Wrn, 100);
+    nv::perf::SetLogVolumeLevel(nv::perf::LogSeverity::Inf, 100);
+
+    auto impl = std::make_unique<PerfSdkHudImpl>();
+    bool initOk = false;
+    switch (rendererType)
+    {
+#if GRAPHICS_API_DIRECTX11
+    case RendererType::DirectX11:
+    {
+        impl->backend = PerfSdkBackend::D3D11;
+        auto* d3dContext = static_cast<ID3D11DeviceContext*>(context->GetNativePtr());
+        ComPtr<ID3D11Device> d3dDevice;
+        if (d3dContext)
+            d3dContext->GetDevice(&d3dDevice);
+        initOk = InitRangeProfilerD3D11(*impl, d3dDevice.Get(), d3dContext, _statusText);
+        break;
+    }
+#endif
+#if GRAPHICS_API_DIRECTX12
+    case RendererType::DirectX12:
+    {
+        impl->backend = PerfSdkBackend::D3D12;
+        initOk = InitRangeProfilerD3D12(*impl, device, _statusText);
+        break;
+    }
+#endif
+#if GRAPHICS_API_VULKAN
+    case RendererType::Vulkan:
+    {
+        impl->backend = PerfSdkBackend::Vulkan;
+        initOk = InitRangeProfilerVulkan(*impl, device, adapter, _statusText);
+        break;
+    }
+#endif
+    default:
+        break;
+    }
+    if (!initOk)
+        return false;
+
+    const String chipName = impl->chipName.empty() ? String(TEXT("GPU")) : String(impl->chipName.c_str());
+    _impl = impl.release();
+    _active = true;
+
+    _statusText = String::Format(TEXT("Nsight Perf: {0} | {1} | Range Profiler (per-region)"), _graphicsApiName, chipName);
+    _overlayText = TEXT("Nsight Perf: select a GPU region to profile.");
+    return true;
+}
+
+void PerfSdkHud::Shutdown()
+{
+    if (!_impl)
+        return;
+
+    auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
+    EndRangeSession(*impl);
+#if GRAPHICS_API_VULKAN
+    if (impl->backend == PerfSdkBackend::Vulkan && impl->vkClockSaved)
+    {
+        nv::perf::VulkanSetDeviceClockState(impl->vkInstance, impl->vkPhysicalDevice, impl->vkDevice, impl->vkSavedClockInfo, vkGetInstanceProcAddr, vkGetDeviceProcAddr);
+        impl->vkClockSaved = false;
+    }
+#endif
+    delete impl;
+    _impl = nullptr;
+    _active = false;
+}
+
+void PerfSdkHud::SetTargetRegion(const String& regionName, int32 regionDepth)
+{
+    if (!_active || !_impl)
+        return;
+
+    auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
+    impl->targetRegionName = regionName;
+    impl->targetRegionNameUtf8 = ToUtf8Ascii(regionName);
+    impl->targetRegionDepth = regionDepth;
+    impl->activeRegionEventIndex = -1;
+    impl->regionRangePushed = false;
+    impl->regionProfilingActive = !regionName.IsEmpty() && regionDepth >= 0;
+    impl->regionCompletionCount = 0;
+    impl->gpuFramesProcessed = 0;
+
+    impl->rangeDataValid = false;
+    impl->rangeMeasurementCount = 0;
+    for (double& v : impl->rangeMetricValues)
+        v = 0.0;
+
+#if GRAPHICS_API_DIRECTX11
+    if (impl->backend == PerfSdkBackend::D3D11)
+    {
+        // Immediate-mode: safe to (re)start the session inline on this thread.
+        if (impl->regionProfilingActive)
+            BeginRangeSession(*impl);
+        else
+            EndRangeSession(*impl);
+    }
+    else
+#endif
+    {
+        // Deferred backends: hand session lifecycle to the render thread (OnFrameBegin). Starting a
+        // queue-based BeginSession here (UI thread) while the render thread drives the queue makes it fail.
+        impl->pendingSessionBegin = impl->regionProfilingActive;
+        impl->pendingSessionEnd = !impl->regionProfilingActive;
+        LOG(Info, "[PerfSDK] SetTargetRegion '{0}' depth {1} ({2}) -> deferring session begin to render-thread OnFrameBegin.",
+            regionName, regionDepth, BackendName(impl->backend));
+    }
+
+    UpdateSessionStatus();
+}
+
+void PerfSdkHud::OnFrameBegin()
+{
+    if (!_active || !_impl)
+        return;
+
+    auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
+
+#if GRAPHICS_API_DIRECTX11
+    // D3D11 is immediate-mode: BeginPass/PushRange happen inline during the region event.
+    if (impl->backend == PerfSdkBackend::D3D11)
+        return;
+#endif
+
+#if GRAPHICS_API_DIRECTX12 || GRAPHICS_API_VULKAN
+    // D3D12/Vulkan: queue-based session begin/end at frame start (before GPU submission), matching
+    // NvPerf ReportGeneratorVulkan::OnFrameStart / D3D12 ReportGeneratorD3D12::OnFrameStart.
+    if (impl->backend == PerfSdkBackend::D3D12 || impl->backend == PerfSdkBackend::Vulkan)
+    {
+        if (impl->pendingSessionEnd)
+        {
+            impl->pendingSessionEnd = false;
+            EndRangeSession(*impl);
+        }
+        if (impl->pendingSessionBegin)
+        {
+            impl->pendingSessionBegin = false;
+            if (!BeginRangeSession(*impl))
+                LOG(Warning, "[PerfSDK] Render-thread BeginRangeSession FAILED ({0}).", BackendName(impl->backend));
+        }
+    }
+#endif
+
+    // Reset per-frame region tracking, then open a queue-level pass before any GPU submission this frame.
+    impl->activeRegionEventIndex = -1;
+    impl->regionRangePushed = false;
+    impl->regionCmdPtr = nullptr;
+    if (!impl->regionProfilingActive || !impl->rangeSessionActive)
+        return;
+    if (RangeIsInPass(*impl))
+        return;
+    // Only open a new pass while the current configuration still needs more passes. Once every pass
+    // has been submitted we must stop and let the counters decode, otherwise the Range Profiler keeps
+    // collecting forever and never reports allStatisticalSamplesCollected.
+    if (RangeAllPassesSubmitted(*impl))
+        return;
+    if (RangeBeginPass(*impl))
+    {
+        impl->dbgPassBeginCount++;
+        if (impl->dbgPassBeginCount <= 3)
+            LOG(Info, "[PerfSDK] OnFrameBegin BeginPass OK ({0}) #{1}.", BackendName(impl->backend), impl->dbgPassBeginCount);
+    }
+    else if (impl->dbgPassBeginCount == 0)
+    {
+        LOG(Warning, "[PerfSDK] OnFrameBegin BeginPass FAILED ({0}).", BackendName(impl->backend));
+    }
+}
+
+void PerfSdkHud::OnFrameEnd()
+{
+    if (!_active || !_impl)
+        return;
+
+    auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
+    impl->gpuFramesProcessed++;
+
+    // Deferred backends close the queue-level pass after all of this frame's command lists have been submitted.
+    if (impl->backend != PerfSdkBackend::D3D11 && RangeIsInPass(*impl))
+    {
+        const bool hadRange = impl->regionRangePushed;
+        if (RangeEndPass(*impl))
+        {
+            impl->rangePassesSubmitted++;
+            impl->dbgPassEndCount++;
+            if (impl->dbgPassEndCount <= 3)
+            {
+                LOG(Info, "[PerfSDK] OnFrameEnd EndPass OK ({0}) #{1} rangePushedThisFrame={2}.",
+                    BackendName(impl->backend), impl->dbgPassEndCount, hadRange ? 1 : 0);
+            }
+        }
+        else if (impl->dbgPassEndCount == 0)
+        {
+            LOG(Warning, "[PerfSDK] OnFrameEnd EndPass FAILED ({0}).", BackendName(impl->backend));
+        }
+        impl->regionRangePushed = false;
+        impl->regionCmdPtr = nullptr;
+        impl->activeRegionEventIndex = -1;
+    }
+
+    // Decode whatever is ready (all backends; never blocks, re-arms the next cycle automatically).
+    RangeDecodeAtFrameEnd(*impl);
+}
+
+void PerfSdkHud::OnProfilerGpuEventBegin(const Char* name, int32 depth, int32 index, GPUContext* context)
+{
+    if (!_active || !_impl || !context)
+        return;
+
+    auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
+    if (impl->activeRegionEventIndex != -1)
+        return; // already bracketing the region this frame
+    if (!MatchesTargetRegion(*impl, name, depth))
+        return;
+
+#if GRAPHICS_API_DIRECTX11
+    if (impl->backend == PerfSdkBackend::D3D11)
+    {
+        // Immediate: open the pass and queue-level range right here around the clicked region.
+        if (!impl->rangeSessionActive || RangeIsInPass(*impl))
+            return;
+        if (!impl->rangeProfilerD3D11.BeginPass())
+            return;
+        if (!impl->rangeProfilerD3D11.PushRange(impl->targetRegionNameUtf8.c_str()))
+        {
+            impl->rangeProfilerD3D11.EndPass();
+            return;
+        }
+        impl->activeRegionEventIndex = index;
+        impl->regionRangePushed = true;
+        return;
+    }
+#endif
+
+    // Deferred (D3D12/Vulkan): the pass was opened at frame begin; mark the region in the command stream.
+    if (!RangeIsInPass(*impl))
+    {
+        if (!impl->dbgLoggedFirstPush)
+        {
+            impl->dbgLoggedFirstPush = true;
+            LOG(Warning, "[PerfSDK] Region '{0}' matched but NO pass open at event begin ({1}). PushRange skipped.",
+                impl->targetRegionName, BackendName(impl->backend));
+        }
+        return;
+    }
+    void* cmd = context->GetNativePtr();
+    if (!cmd)
+    {
+        LOG(Warning, "[PerfSDK] Region '{0}' matched but context native cmd ptr is null ({1}).",
+            impl->targetRegionName, BackendName(impl->backend));
+        return;
+    }
+    bool pushed = false;
+#if GRAPHICS_API_DIRECTX12
+    if (impl->backend == PerfSdkBackend::D3D12)
+        pushed = nv::perf::profiler::D3D12PushRange(static_cast<ID3D12GraphicsCommandList*>(cmd), impl->targetRegionNameUtf8.c_str());
+#endif
+#if GRAPHICS_API_VULKAN
+    if (impl->backend == PerfSdkBackend::Vulkan)
+        pushed = nv::perf::profiler::VulkanPushRange(static_cast<VkCommandBuffer>(cmd), impl->targetRegionNameUtf8.c_str());
+#endif
+    if (!pushed)
+    {
+        LOG(Warning, "[PerfSDK] PushRange FAILED for region '{0}' ({1}).", impl->targetRegionName, BackendName(impl->backend));
+        return;
+    }
+    impl->dbgRangePushCount++;
+    if (!impl->dbgLoggedFirstPush)
+    {
+        impl->dbgLoggedFirstPush = true;
+        LOG(Info, "[PerfSDK] PushRange OK for region '{0}' ({1}) cmd={2}.",
+            impl->targetRegionName, BackendName(impl->backend), (uint64)(uintptr_t)cmd);
+    }
+    impl->activeRegionEventIndex = index;
+    impl->regionRangePushed = true;
+    impl->regionCmdPtr = cmd; // pop must target the same command list/buffer the range was pushed into
+}
+
+void PerfSdkHud::OnProfilerGpuEventEnd(int32 index, GPUContext* context)
+{
+    if (!_active || !_impl)
+        return;
+
+    auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
+    if (index != impl->activeRegionEventIndex)
+        return;
+
+    if (impl->backend == PerfSdkBackend::D3D11)
+    {
+#if GRAPHICS_API_DIRECTX11
+        if (impl->regionRangePushed)
+        {
+            impl->rangeProfilerD3D11.PopRange();
+            impl->rangeProfilerD3D11.EndPass();
+            impl->rangePassesSubmitted++;
+        }
+#endif
+    }
+    else if (impl->regionRangePushed)
+    {
+        // Pop on the exact command list/buffer used for the push (the context may have rotated buffers).
+        void* cmd = impl->regionCmdPtr;
+        if (cmd)
+        {
+#if GRAPHICS_API_DIRECTX12
+            if (impl->backend == PerfSdkBackend::D3D12)
+                nv::perf::profiler::D3D12PopRange(static_cast<ID3D12GraphicsCommandList*>(cmd));
+#endif
+#if GRAPHICS_API_VULKAN
+            if (impl->backend == PerfSdkBackend::Vulkan)
+                nv::perf::profiler::VulkanPopRange(static_cast<VkCommandBuffer>(cmd));
+#endif
+        }
+    }
+
+    impl->regionRangePushed = false;
+    impl->regionCmdPtr = nullptr;
+    impl->activeRegionEventIndex = -1;
+    impl->regionCompletionCount++;
+}
+
+void PerfSdkHud::UpdateSessionStatus()
+{
+    if (!_active || !_impl)
+        return;
+
+    auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
+
+    if (!impl->regionProfilingActive)
+    {
+        _statusText = String::Format(TEXT("Nsight Perf: {0} | Range Profiler | select a GPU region"), _graphicsApiName);
+        return;
+    }
+    const String state = impl->rangeDataValid
+        ? String::Format(TEXT("ready ({0} updates)"), impl->rangeMeasurementCount)
+        : String::Format(TEXT("collecting pass {0}/{1}"), impl->rangePassesSubmitted, (int32)impl->rangePassesPerSample);
+    _statusText = String::Format(
+        TEXT("Nsight Perf: {0} | per-region \"{1}\" depth {2} | hits {3} | {4}"),
+        _graphicsApiName,
+        impl->targetRegionName,
+        impl->targetRegionDepth,
+        impl->regionCompletionCount,
+        state);
+}
+
+void PerfSdkHud::GetDesignerMetrics(Array<RenderPerfTools::DesignerGpuMetric, InlinedAllocation<32>>& metrics) const
+{
+    metrics.Clear();
+    if (!_active || !_impl)
+        return;
+
+    auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
+    if (!impl->rangeDataValid)
+        return;
+    for (size_t k = 0; k < impl->activeRangeDefs.size(); k++)
+    {
+        const RangeAreaDefinition& def = gRangeAreaDefinitions[impl->activeRangeDefs[k]];
+        const double rawValue = k < impl->rangeMetricValues.size() ? impl->rangeMetricValues[k] : 0.0;
+        RenderPerfTools::DesignerGpuMetric metric;
+        metric.Title = def.AreaName;
+        metric.Hint = FormatMetricDetail(def.MetricLabel, def.Format, rawValue);
+        metric.Value = ComputeBarValue(def.Format, def.BarScale, rawValue);
+        metric.HigherIsBetter = def.HigherIsBetter;
+        metrics.Add(metric);
+    }
+}
+
+String PerfSdkHud::GetChipAreasText() const
+{
+    if (!_active || !_impl)
+        return String::Empty;
+
+    auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
+    StringBuilder sb;
+
+    for (const Char* groupName : gChipAreaGroupOrder)
+    {
+        bool wroteGroup = false;
+        for (size_t k = 0; k < impl->activeRangeDefs.size(); k++)
+        {
+            const RangeAreaDefinition& def = gRangeAreaDefinitions[impl->activeRangeDefs[k]];
+            if (String(def.GroupName) != groupName)
+                continue;
+            if (!wroteGroup)
+            {
+                sb.AppendFormat(TEXT("#GROUP\t{0}\n"), groupName);
+                wroteGroup = true;
+            }
+            const bool hasData = impl->rangeDataValid;
+            const double rawValue = (hasData && k < impl->rangeMetricValues.size()) ? impl->rangeMetricValues[k] : 0.0;
+            const float bar = hasData ? ComputeBarValue(def.Format, def.BarScale, rawValue) : 0.0f;
+            const String detail = hasData ? FormatMetricDetail(def.MetricLabel, def.Format, rawValue) : TEXT("Collecting region samples...");
+            sb.AppendFormat(TEXT("{0}\t{1:.1f}\t{2}\t{3}\n"), def.AreaName, bar, detail, def.HigherIsBetter ? 1 : 0);
+        }
+    }
+    return sb.ToString();
+}
+
+#else
+
+bool PerfSdkHud::TryInitialize(GPUDevice*, GPUAdapter*, GPUContext*)
+{
+    _graphicsApiName = TEXT("Unknown");
+    _statusText = TEXT("Nsight Perf: Windows + COMPILE_WITH_RENDER_PERF_NVPERF build required.");
+    return false;
+}
+
+void PerfSdkHud::Shutdown()
+{
+    _active = false;
+}
+
+void PerfSdkHud::OnFrameBegin(GPUContext*)
+{
+}
+
+void PerfSdkHud::OnFrameEnd(GPUContext*)
+{
+}
+
+void PerfSdkHud::SetTargetRegion(const String&, int32)
+{
+}
+
+void PerfSdkHud::UpdateSessionStatus()
+{
+}
+
+void PerfSdkHud::OnProfilerGpuEventBegin(const Char*, int32, int32, GPUContext*)
+{
+}
+
+void PerfSdkHud::OnProfilerGpuEventEnd(const Char*, int32, int32, GPUContext*)
+{
+}
+
+void PerfSdkHud::GetDesignerMetrics(Array<RenderPerfTools::DesignerGpuMetric, InlinedAllocation<32>>& metrics) const
+{
+    metrics.Clear();
+}
+
+String PerfSdkHud::GetChipAreasText() const
+{
+    return String::Empty;
+}
+
+#endif
