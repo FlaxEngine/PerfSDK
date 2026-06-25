@@ -8,6 +8,8 @@ using Flax.Build.NativeCpp;
 /// </summary>
 public class PerfSDK : GameModule
 {
+    private static bool _logOnce;
+
     /// <summary>
     /// Conditionally imports module into the build depending on the target platform support.
     /// </summary>
@@ -25,6 +27,7 @@ public class PerfSDK : GameModule
             }
             break;
         }
+        result &= Profiler.Use(options);
         if (result)
             dependencies.Add("PerfSDK");
         return result;
@@ -101,7 +104,7 @@ public class PerfSDK : GameModule
         {
             perfVersion = File.ReadAllText(versionFile);
         }
-        Log.Info($"Using PerfSDK v{perfVersion} ({perfSdk})");
+        Log.InfoOnce($"Using PerfSDK v{perfVersion} ({perfSdk})", ref _logOnce);
 
         // Include PerfSDK
         options.PublicDefinitions.Add("COMPILE_WITH_RENDER_PERF_NVPERF");
