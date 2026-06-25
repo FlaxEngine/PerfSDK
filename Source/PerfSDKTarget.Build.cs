@@ -1,4 +1,5 @@
 using Flax.Build;
+using Flax.Build.NativeCpp;
 
 public class PerfSDKTarget : GameProjectTarget
 {
@@ -16,5 +17,11 @@ public class PerfSDKTarget : GameProjectTarget
             TargetArchitecture.x64,
         };
         Modules.Add("PerfSDK");
+    }
+
+    /// <inheritdoc />
+    public override bool CanBuild(BuildOptions options)
+    {
+        return base.CanBuild(options) && PerfSDK.ConditionalImport(options);
     }
 }

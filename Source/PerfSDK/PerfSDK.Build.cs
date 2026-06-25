@@ -13,7 +13,7 @@ public class PerfSDK : GameModule
     /// <summary>
     /// Conditionally imports module into the build depending on the target platform support.
     /// </summary>
-    public static bool ConditionalImport(BuildOptions options, System.Collections.Generic.List<string> dependencies)
+    public static bool ConditionalImport(BuildOptions options, System.Collections.Generic.List<string> dependencies = null)
     {
         bool result = false;
         switch (options.Platform.Target)
@@ -28,7 +28,7 @@ public class PerfSDK : GameModule
             break;
         }
         result &= Profiler.Use(options);
-        if (result)
+        if (result && dependencies != null)
             dependencies.Add("PerfSDK");
         return result;
     }
