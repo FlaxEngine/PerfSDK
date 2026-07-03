@@ -6,15 +6,16 @@ NVIDIA Nsight PerfSDK integration for the Flax Editor GPU Profiler. Click a GPU 
 
 ## Requirements
 
-- Windows x64
+- Windows x64 or Linux x64
 - Flax 1.13+
 - NVIDIA GPU + Nsight Perf SDK installed
-- Environment variable **`NVPERF_SDK_PATH`** pointing at your Perf SDK root (e.g. `C:\Downloads\PerfSDK_2025_5`)
+- Environment variable **`NVPERF_SDK_PATH`** pointing at your Perf SDK root (e.g. `C:\Downloads\PerfSDK_2025_5` or `/opt/NVIDIA_Nsight_Perf_SDK`)
 
 ## Setup
 
 1. Set `NVPERF_SDK_PATH` in your user/system environment.
-2. Clone plugin via Editor [Plugin Window tool](https://docs.flaxengine.com/manual/scripting/plugins/plugin-project.html#automated-git-cloning), ensure game project references it:
+2. On Linux, ensure the NvPerf host library directory is on the loader path. The plugin prepends `NvPerf/lib/a64` to `LD_LIBRARY_PATH` at runtime; you can also set it yourself before launching the editor.
+3. Clone plugin via Editor [Plugin Window tool](https://docs.flaxengine.com/manual/scripting/plugins/plugin-project.html#automated-git-cloning), ensure game project references it:
 
 ```
 ...
@@ -28,30 +29,31 @@ NVIDIA Nsight PerfSDK integration for the Flax Editor GPU Profiler. Click a GPU 
 ]
 ```
 
-2. Open the project and **Build & Run** (or compile scripts) so the PerfSDK plugin native module links against NVPerf.
-3. Play the scene, open **Profiler → GPU**, enable live recording, then **left-click** a region.
+4. Open the project and **Build & Run** (or compile scripts) so the PerfSDK plugin native module links against NVPerf.
+5. Play the scene, open **Profiler → GPU**, enable live recording, then **left-click** a region.
 
 ## Supported Platforms
 
 Platforms:
 * Windows x64
+* Linux x64 (Vulkan only)
 
 Graphics APIs:
-* DirectX 11
-* DirectX 12
-* Vulkan
+* DirectX 11 (Windows)
+* DirectX 12 (Windows)
+* Vulkan (Windows and Linux)
 
 ## API
 
-In order to access PErfSDK API in C++/C# scripting import it in your code module (modify `Game.Build.cs` file):
+In order to access PerfSDK API in C++/C# scripting import it in your code module (modify `Game.Build.cs` file):
 
 ```cs
 public override void Setup(BuildOptions options)
 {
     base.Setup(options);
 
-    // Adds PerfSDF module to PrivateDependencies if supported on current platform (eg. Windows x64)
-    PerfSDF.ConditionalImport(options, options.PrivateDependencies);
+    // Adds PerfSDK module to PrivateDependencies if supported on current platform (Windows/Linux x64)
+    PerfSDK.ConditionalImport(options, options.PrivateDependencies);
 }
 ```
 

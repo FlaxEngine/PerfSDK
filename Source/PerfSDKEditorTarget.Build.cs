@@ -10,6 +10,7 @@ public class PerfSDKEditorTarget : GameProjectEditorTarget
         Platforms = new[]
         {
             TargetPlatform.Windows,
+            TargetPlatform.Linux,
         };
         Architectures = new[]
         {

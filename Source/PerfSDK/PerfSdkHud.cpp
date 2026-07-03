@@ -16,8 +16,10 @@
 #include "Engine/Core/Log.h"
 #include "Engine/Core/Types/StringBuilder.h"
 #include "Engine/Engine/Engine.h"
+#include "Engine/Platform/FileSystem.h"
 #include "Engine/Platform/Platform.h"
 #include "Engine/Platform/StringUtils.h"
+#include "Engine/Utilities/StringConverter.h"
 
 #if COMPILE_WITH_RENDER_PERF_NVPERF
 
@@ -36,14 +38,27 @@
 #include <string>
 #include <vector>
 
-#include <d3d11.h>
-#include <d3d12.h>
+#if GRAPHICS_API_DIRECTX11 || GRAPHICS_API_DIRECTX12
 #include <dxgi.h>
+#if GRAPHICS_API_DIRECTX11
+#include <d3d11.h>
+#endif
+#if GRAPHICS_API_DIRECTX12
+#include <d3d12.h>
+#endif
+#if PLATFORM_WIN32
 #include <wrl/client.h>
+#endif
+#endif
 
 #if PLATFORM_WIN32
-#include "Engine/Platform/Win32/IncludeWindowsHeaders.h"
+// D3D/DXGI headers include Windows.h and define GetEnvironmentVariable/GetCommandLine
+// macros that break Flax Platform::GetEnvironmentVariable and Engine::GetCommandLine.
+#undef GetEnvironmentVariable
+#undef SetEnvironmentVariable
+#undef GetCommandLine
 #endif
+
 #include <ThirdParty/volk/volk.h>
 
 #define RYML_SINGLE_HDR_DEFINE_NOW
@@ -56,12 +71,9 @@
 #include <NvPerfHudDataModel.h>
 #include <NvPerfHudTextRenderer.h>
 
-#include <NvPerfD3D11.h>
-#include <NvPerfD3D12.h>
 #include <NvPerfVulkan.h>
 #include <NvPerfMetricConfigurationsHAL.h>
 #include <NvPerfPeriodicSamplerGpu.h>
-#include <NvPerfPeriodicSamplerD3D12.h>
 #include <NvPerfPeriodicSamplerVulkan.h>
 #include <NvPerfCounterData.h>
 #include <NvPerfScopeExitGuard.h>
@@ -69,9 +81,16 @@
 #include <NvPerfMetricsEvaluator.h>
 #include <NvPerfMetricsConfigBuilder.h>
 #include <NvPerfCounterConfiguration.h>
-#include <NvPerfRangeProfilerD3D11.h>
-#include <NvPerfRangeProfilerD3D12.h>
 #include <NvPerfRangeProfilerVulkan.h>
+#if GRAPHICS_API_DIRECTX11
+#include <NvPerfD3D11.h>
+#include <NvPerfRangeProfilerD3D11.h>
+#endif
+#if GRAPHICS_API_DIRECTX12
+#include <NvPerfD3D12.h>
+#include <NvPerfPeriodicSamplerD3D12.h>
+#include <NvPerfRangeProfilerD3D12.h>
+#endif
 
 #include "nvperf_host_impl.h"
 
@@ -93,7 +112,9 @@ PFN_vkQueueWaitIdle vkQueueWaitIdle = nullptr;
 
 namespace
 {
+#if GRAPHICS_API_DIRECTX11 || GRAPHICS_API_DIRECTX12
     using Microsoft::WRL::ComPtr;
+#endif
 
     static String RendererTypeToDisplayName(RendererType type)
     {
@@ -264,6 +285,8 @@ namespace
         // NVPA_STATUS_INVALID_CONTEXT_STATE because the present is still in flight. D3D11 is immediate-mode.
         bool pendingSessionBegin = false;   // render thread should (re)start the range session
         bool pendingSessionEnd = false;     // render thread should end the range session
+        uint32_t sessionBeginAttempts = 0;  // BeginRangeSession tries while deferred session is pending
+        String lastSessionError;            // last NvPerf BeginSession failure (e.g. ERR_NVGPUCTRPERM)
 
         // ---- Diagnostics (deferred backend stall investigation) ----
         uint32_t dbgPassBeginCount = 0;     // queue-level BeginPass calls that succeeded
@@ -272,6 +295,28 @@ namespace
         uint32_t dbgDecodeCallCount = 0;    // DecodeCounters calls (poll)
         bool dbgLoggedFirstPush = false;
     };
+
+    // Captured from the most recent NvPerf ERR log during BeginSession (cleared at each attempt).
+    static String gPendingNvPerfSessionError;
+
+    static void CaptureNvPerfSessionError(const String& message)
+    {
+        if (message.Contains(TEXT("profiling permissions"), StringSearchCase::IgnoreCase) ||
+            message.Contains(TEXT("ERR_NVGPUCTRPERM"), StringSearchCase::IgnoreCase))
+        {
+            gPendingNvPerfSessionError =
+                TEXT("ERR_NVGPUCTRPERM: GPU profiling permissions not enabled — see https://developer.nvidia.com/ERR_NVGPUCTRPERM");
+        }
+    }
+
+    static void NoteBeginRangeSessionFailed(PerfSdkHudImpl& impl)
+    {
+        impl.sessionBeginAttempts++;
+        if (!gPendingNvPerfSessionError.IsEmpty())
+            impl.lastSessionError = gPendingNvPerfSessionError;
+        else if (impl.lastSessionError.IsEmpty())
+            impl.lastSessionError = TEXT("BeginRangeSession failed — see Output Log for [NvPerf] errors.");
+    }
 
     // Forwards NvPerf's internal log messages (errors like "profiling permissions not enabled",
     // "resource conflict", "insufficient driver version", etc.) into the Flax log so we can see
@@ -285,7 +330,10 @@ namespace
         message.Replace(TEXT("\r"), TEXT(" "));
         const bool isError = prefix.Contains(TEXT("ERR")) || prefix.Contains(TEXT("err"));
         if (isError)
+        {
+            CaptureNvPerfSessionError(message);
             LOG(Warning, "[NvPerf:{0}] {1} ({2})", prefix, message, func);
+        }
         else
             LOG(Info, "[NvPerf:{0}] {1}", prefix, message);
     }
@@ -310,34 +358,55 @@ namespace
 
     static bool TrySetNvPerfLibraryPath()
     {
-        std::vector<std::wstring> candidates;
-        wchar_t envPath[1024];
-        if (GetEnvironmentVariableW(L"NVPERF_SDK_PATH", envPath, 1024) > 0)
-            candidates.emplace_back(envPath);
+        String envPath;
+        if (Platform::GetEnvironmentVariable(TEXT("NVPERF_SDK_PATH"), envPath) || envPath.IsEmpty())
+            return true;
 
-        for (const std::wstring& root : candidates)
+#if PLATFORM_WIN32
+        const String libDir = envPath / TEXT("NvPerf") / TEXT("bin") / TEXT("x64");
+        if (!FileSystem::DirectoryExists(libDir))
+            return true;
+
+        const wchar_t* paths[] = { *libDir };
+        NVPW_SetLibraryLoadPathsW_Params params = { NVPW_SetLibraryLoadPathsW_Params_STRUCT_SIZE };
+        params.numPaths = 1;
+        params.ppwPaths = paths;
+        NVPW_SetLibraryLoadPathsW(&params);
+#else
+        static const Char* libSubdirs[] =
         {
-            const std::wstring binPath = root + L"\\NvPerf\\bin\\x64";
-            if (GetFileAttributesW(binPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+            TEXT("NvPerf/lib/a64"),
+            TEXT("NvPerf/lib/x64"),
+        };
+        for (const Char* subdir : libSubdirs)
+        {
+            const String libDir = envPath / subdir;
+            if (!FileSystem::DirectoryExists(libDir))
                 continue;
 
-            const wchar_t* paths[] = { binPath.c_str() };
-            NVPW_SetLibraryLoadPathsW_Params params = { NVPW_SetLibraryLoadPathsW_Params_STRUCT_SIZE };
-            params.numPaths = 1;
-            params.ppwPaths = paths;
-            if (NVPW_SetLibraryLoadPathsW(&params) == NVPA_STATUS_SUCCESS)
-                return true;
+            String ldPath;
+            Platform::GetEnvironmentVariable(TEXT("LD_LIBRARY_PATH"), ldPath);
+            if (ldPath.IsEmpty())
+                ldPath = libDir;
+            else if (!ldPath.Contains(libDir))
+                ldPath = libDir + TEXT(":") + ldPath;
+            Platform::SetEnvironmentVariable(TEXT("LD_LIBRARY_PATH"), ldPath);
+            break;
         }
+#endif
         return true;
     }
 
-    static bool MatchesTargetRegion(const PerfSdkHudImpl& impl, const Char* name, int32 depth)
+    static bool MatchesTargetRegion(PerfSdkHudImpl& impl, const Char* name, int32 depth)
     {
         if (!impl.regionProfilingActive || impl.targetRegionName.IsEmpty() || !name)
             return false;
-        if (depth != impl.targetRegionDepth)
+        if (StringUtils::CompareIgnoreCase(impl.targetRegionName.Get(), name) != 0)
             return false;
-        return StringUtils::CompareIgnoreCase(impl.targetRegionName.Get(), name) == 0;
+        // The profiler UI depth is from a captured frame and often differs from live GPU events
+        // (especially right after enabling ProfilingTools). Match by region name only.
+        (void)depth;
+        return true;
     }
 
     static float NormalizeMetricPercent(double value)
@@ -857,6 +926,7 @@ namespace
 
     static bool BeginRangeSession(PerfSdkHudImpl& impl)
     {
+        gPendingNvPerfSessionError.Clear();
         EndRangeSession(impl);
 
         // D3D12/Vulkan: the queue-based NVPW BeginSession returns NVPA_STATUS_INVALID_CONTEXT_STATE when the
@@ -927,6 +997,8 @@ namespace
             BackendName(impl.backend), (int32)impl.rangePassesPerSample, (int32)impl.activeRangeDefs.size());
 
         impl.rangeSessionActive = true;
+        impl.sessionBeginAttempts = 0;
+        impl.lastSessionError.Clear();
         impl.regionRangePushed = false;
         impl.activeRegionEventIndex = -1;
         impl.rangePassesSubmitted = 0;
@@ -1127,9 +1199,11 @@ void PerfSdkHud::SetTargetRegion(const String& regionName, int32 regionDepth)
     impl->targetRegionDepth = regionDepth;
     impl->activeRegionEventIndex = -1;
     impl->regionRangePushed = false;
-    impl->regionProfilingActive = !regionName.IsEmpty() && regionDepth >= 0;
+    impl->regionProfilingActive = !regionName.IsEmpty();
+    impl->sessionBeginAttempts = 0;
     impl->regionCompletionCount = 0;
     impl->gpuFramesProcessed = 0;
+    impl->lastSessionError.Clear();
 
     impl->rangeDataValid = false;
     impl->rangeMeasurementCount = 0;
@@ -1141,7 +1215,10 @@ void PerfSdkHud::SetTargetRegion(const String& regionName, int32 regionDepth)
     {
         // Immediate-mode: safe to (re)start the session inline on this thread.
         if (impl->regionProfilingActive)
-            BeginRangeSession(*impl);
+        {
+            if (!BeginRangeSession(*impl))
+                NoteBeginRangeSessionFailed(*impl);
+        }
         else
             EndRangeSession(*impl);
     }
@@ -1169,7 +1246,20 @@ void PerfSdkHud::OnFrameBegin()
 #if GRAPHICS_API_DIRECTX11
     // D3D11 is immediate-mode: BeginPass/PushRange happen inline during the region event.
     if (impl->backend == PerfSdkBackend::D3D11)
+    {
+        if (impl->regionProfilingActive && !impl->rangeSessionActive)
+        {
+            if (BeginRangeSession(*impl))
+                impl->sessionBeginAttempts = 0;
+            else
+            {
+                NoteBeginRangeSessionFailed(*impl);
+                if (impl->sessionBeginAttempts <= 3 || (impl->sessionBeginAttempts % 120) == 0)
+                    LOG(Warning, "[PerfSDK] D3D11 BeginRangeSession FAILED, attempt {0}.", impl->sessionBeginAttempts);
+            }
+        }
         return;
+    }
 #endif
 
 #if GRAPHICS_API_DIRECTX12 || GRAPHICS_API_VULKAN
@@ -1182,11 +1272,16 @@ void PerfSdkHud::OnFrameBegin()
             impl->pendingSessionEnd = false;
             EndRangeSession(*impl);
         }
-        if (impl->pendingSessionBegin)
+        if (impl->pendingSessionBegin || (impl->regionProfilingActive && !impl->rangeSessionActive))
         {
-            impl->pendingSessionBegin = false;
-            if (!BeginRangeSession(*impl))
-                LOG(Warning, "[PerfSDK] Render-thread BeginRangeSession FAILED ({0}).", BackendName(impl->backend));
+            if (BeginRangeSession(*impl))
+                impl->pendingSessionBegin = false;
+            else
+            {
+                NoteBeginRangeSessionFailed(*impl);
+                if (impl->sessionBeginAttempts <= 3 || (impl->sessionBeginAttempts % 120) == 0)
+                    LOG(Warning, "[PerfSDK] Render-thread BeginRangeSession FAILED ({0}), attempt {1}.", BackendName(impl->backend), impl->sessionBeginAttempts);
+            }
         }
     }
 #endif
@@ -1380,9 +1475,19 @@ void PerfSdkHud::UpdateSessionStatus()
         _statusText = String::Format(TEXT("Nsight Perf: {0} | Range Profiler | select a GPU region"), _graphicsApiName);
         return;
     }
-    const String state = impl->rangeDataValid
-        ? String::Format(TEXT("ready ({0} updates)"), impl->rangeMeasurementCount)
-        : String::Format(TEXT("collecting pass {0}/{1}"), impl->rangePassesSubmitted, (int32)impl->rangePassesPerSample);
+    String state;
+    if (impl->rangeDataValid)
+        state = String::Format(TEXT("ready ({0} updates)"), impl->rangeMeasurementCount);
+    else if (!impl->rangeSessionActive && !impl->lastSessionError.IsEmpty())
+        state = impl->lastSessionError;
+    else if (!impl->rangeSessionActive && impl->gpuFramesProcessed == 0)
+        state = TEXT("waiting for GPU frame — press Play (Vulkan/D3D12 start session on render thread)");
+    else if (!impl->rangeSessionActive)
+        state = String::Format(TEXT("session failed ({0} attempts) — see Output Log for [PerfSDK]"), impl->sessionBeginAttempts);
+    else if (impl->rangeSessionActive && impl->dbgRangePushCount == 0 && impl->gpuFramesProcessed > 5)
+        state = TEXT("no PushRange yet — Play scene, double-click a region that runs every frame");
+    else
+        state = String::Format(TEXT("collecting pass {0}/{1}"), impl->rangePassesSubmitted, (int32)impl->rangePassesPerSample);
     _statusText = String::Format(
         TEXT("Nsight Perf: {0} | per-region \"{1}\" depth {2} | hits {3} | {4}"),
         _graphicsApiName,
@@ -1438,7 +1543,22 @@ String PerfSdkHud::GetChipAreasText() const
             const bool hasData = impl->rangeDataValid;
             const double rawValue = (hasData && k < impl->rangeMetricValues.size()) ? impl->rangeMetricValues[k] : 0.0;
             const float bar = hasData ? ComputeBarValue(def.Format, def.BarScale, rawValue) : 0.0f;
-            const String detail = hasData ? FormatMetricDetail(def.MetricLabel, def.Format, rawValue) : TEXT("Collecting region samples...");
+            String detail;
+            if (hasData)
+                detail = FormatMetricDetail(def.MetricLabel, def.Format, rawValue);
+            else if (!impl->rangeSessionActive)
+            {
+                if (!impl->lastSessionError.IsEmpty())
+                    detail = impl->lastSessionError;
+                else if (impl->gpuFramesProcessed == 0)
+                    detail = TEXT("Press Play — range session starts on first GPU frame");
+                else
+                    detail = String::Format(TEXT("Range session failed ({0} attempts) — see Output Log"), impl->sessionBeginAttempts);
+            }
+            else if (impl->dbgRangePushCount == 0)
+                detail = TEXT("Waiting for region PushRange (Play + double-click GPU region)");
+            else
+                detail = TEXT("Collecting region samples...");
             sb.AppendFormat(TEXT("{0}\t{1:.1f}\t{2}\t{3}\n"), def.AreaName, bar, detail, def.HigherIsBetter ? 1 : 0);
         }
     }
@@ -1450,7 +1570,7 @@ String PerfSdkHud::GetChipAreasText() const
 bool PerfSdkHud::TryInitialize(GPUDevice*, GPUAdapter*, GPUContext*)
 {
     _graphicsApiName = TEXT("Unknown");
-    _statusText = TEXT("Nsight Perf: Windows + COMPILE_WITH_RENDER_PERF_NVPERF build required.");
+    _statusText = TEXT("Nsight Perf: COMPILE_WITH_RENDER_PERF_NVPERF build required.");
     return false;
 }
 
@@ -1459,11 +1579,11 @@ void PerfSdkHud::Shutdown()
     _active = false;
 }
 
-void PerfSdkHud::OnFrameBegin(GPUContext*)
+void PerfSdkHud::OnFrameBegin()
 {
 }
 
-void PerfSdkHud::OnFrameEnd(GPUContext*)
+void PerfSdkHud::OnFrameEnd()
 {
 }
 
@@ -1479,7 +1599,7 @@ void PerfSdkHud::OnProfilerGpuEventBegin(const Char*, int32, int32, GPUContext*)
 {
 }
 
-void PerfSdkHud::OnProfilerGpuEventEnd(const Char*, int32, int32, GPUContext*)
+void PerfSdkHud::OnProfilerGpuEventEnd(int32, GPUContext*)
 {
 }
 

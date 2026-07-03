@@ -35,7 +35,7 @@ namespace NVIDIA
 
             if (_updateHookRegistered && Editor.Instance != null)
             {
-                Editor.Instance.EditorUpdate += OnUpdate;
+                Editor.Instance.EditorUpdate -= OnUpdate;
                 _updateHookRegistered = false;
             }
         }
@@ -45,7 +45,7 @@ namespace NVIDIA
             if (_updateHookRegistered || Editor.Instance == null)
                 return;
 
-            Editor.Instance.EditorUpdate -= OnUpdate;
+            Editor.Instance.EditorUpdate += OnUpdate;
             _updateHookRegistered = true;
         }
 
@@ -75,11 +75,13 @@ namespace NVIDIA
                 {
                     MessageBox.Show(
                         "PerfSDK native module was built without Nsight Perf SDK support.\n\n" +
-                        "1. Set user or system env var NVPERF_SDK_PATH to your SDK root (folder containing redist\\ and NvPerf\\).\n" +
-                        "   Example: C:\\Downloads\\PerfSDK_2025_5\n" +
+                        "1. Set user or system env var NVPERF_SDK_PATH to your SDK root (folder containing NvPerf/).\n" +
+                        "   Windows example: C:\\Downloads\\PerfSDK_2025_5\n" +
+                        "   Linux example: /opt/NVIDIA_Nsight_Perf_SDK\n" +
                         "2. Fully close and reopen Flax Editor (required so the build tool sees the variable).\n" +
                         "3. Tools → Recompile Scripts (or Build & Run).\n\n" +
-                        "Check the Output Log during compile for \"PerfSDK: building with Nsight Perf SDK\".",
+                        "On Linux, also ensure NvPerf/lib/a64 is on LD_LIBRARY_PATH if runtime loading fails.\n" +
+                        "Check the Output Log during compile for \"Using PerfSDK v...\".",
                         "PerfSDK",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Warning);

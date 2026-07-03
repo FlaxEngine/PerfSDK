@@ -11,6 +11,7 @@ public class PerfSDKTarget : GameProjectTarget
         Platforms = new[]
         {
             TargetPlatform.Windows,
+            TargetPlatform.Linux,
         };
         Architectures = new[]
         {

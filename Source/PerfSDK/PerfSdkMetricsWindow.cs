@@ -131,7 +131,9 @@ namespace FlaxEditor.Windows
             TryGetLiveRegionStats(regionName, ref gpuTimeMs, ref drawCalls, ref triangles, ref vertices);
 
             _table.SetRegionStats(regionName, gpuTimeMs, drawCalls, triangles, vertices);
-            _table.SetChipAreasText(RenderPerfTools.ChipAreasText);
+            string chipAreas = RenderPerfTools.ChipAreasText;
+            _table.SetChipAreasText(chipAreas);
+            _table.SetEmptyMessage(string.IsNullOrEmpty(chipAreas) ? RenderPerfTools.StatusText : "Collecting GPU samples...");
         }
 
         private static unsafe void TryGetLiveRegionStats(string regionName, ref float gpuTimeMs, ref long drawCalls, ref long triangles, ref long vertices)
@@ -235,6 +237,12 @@ namespace FlaxEditor.Windows
                     drawCalls,
                     triangles,
                     vertices);
+            }
+
+            public void SetEmptyMessage(string message)
+            {
+                if (!string.IsNullOrEmpty(message))
+                    _emptyMessage = message;
             }
 
             public void SetChipAreasText(string text)
