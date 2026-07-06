@@ -1,5 +1,6 @@
 #if FLAX_EDITOR && USE_PROFILER
 using FlaxEditor;
+using FlaxEditor.GUI;
 using FlaxEditor.GUI.Docking;
 using FlaxEngine;
 using FlaxEngine.GUI;
@@ -16,11 +17,18 @@ namespace FlaxEditor.Windows
     {
         private static readonly Float2 MetricsWindowSize = new Float2(460, 860);
 
-        private const float TopMargin = 8.0f;
         private const float StatusHeight = 18.0f;
+        private const float AddButtonHeight = 28.0f;
+        private const float AddButtonWidth = 160.0f;
+        private const float HorizontalPadding = 8.0f;
 
+        private ToolStrip _toolStrip;
+        private Button _addMetricButton;
         private Label _statusLabel;
+        private Panel _tableScroll;
         private ChipMetricsTable _table;
+        private float _contentTop;
+        private string _lastStatusText = string.Empty;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="PerfSdkMetricsWindow"/> class.
@@ -32,23 +40,59 @@ namespace FlaxEditor.Windows
             Title = "Nvidia PerfSDK Metrics";
             Size = MetricsWindowSize;
 
+            // ToolStrip uses Flax Margin (left, right, top, bottom) where bottom = height.
+            _toolStrip = new ToolStrip(34.0f)
+            {
+                Parent = this,
+            };
+            _toolStrip.AddButton(Editor.Icons.Add64, "Add metric", OnAddMetricClicked).LinkTooltip("Browse and add GPU metrics");
+
             _statusLabel = new Label
             {
                 AnchorPreset = AnchorPresets.HorizontalStretchTop,
-                Offsets = new Margin(8, TopMargin, 8, 0),
-                Height = StatusHeight,
                 HorizontalAlignment = TextAlignment.Near,
                 IsScrollable = false,
                 TextColor = Style.Current.Foreground * 0.75f,
                 Parent = this,
             };
 
-            _table = new ChipMetricsTable
+            _tableScroll = new Panel(ScrollBars.Vertical)
             {
                 AnchorPreset = AnchorPresets.StretchAll,
-                Offsets = new Margin(8, TopMargin + StatusHeight + 4.0f, 8, 8),
                 Parent = this,
             };
+
+            _table = new ChipMetricsTable
+            {
+                Parent = _tableScroll,
+            };
+
+            // Add last so it draws and hit-tests above the stretch table if margins overlap during layout.
+            _addMetricButton = new Button(0, 0, AddButtonWidth, AddButtonHeight)
+            {
+                Text = "+ Add metric",
+                Parent = this,
+            };
+            _addMetricButton.Clicked += OnAddMetricClicked;
+
+            PerformLayout();
+        }
+
+        /// <inheritdoc />
+        protected override void PerformLayoutBeforeChildren()
+        {
+            base.PerformLayoutBeforeChildren();
+
+            if (_toolStrip == null || _addMetricButton == null || _statusLabel == null || _tableScroll == null || _table == null)
+                return;
+
+            float addButtonY = _toolStrip.Bottom + 2.0f;
+            _addMetricButton.Bounds = new Rectangle(HorizontalPadding, addButtonY, AddButtonWidth, AddButtonHeight);
+
+            _contentTop = addButtonY + AddButtonHeight + 4.0f;
+            _statusLabel.Offsets = new Margin(HorizontalPadding, HorizontalPadding, _contentTop, StatusHeight);
+            _tableScroll.Offsets = new Margin(HorizontalPadding, HorizontalPadding, _contentTop + StatusHeight + 4.0f, HorizontalPadding);
+            _table.Width = Math.Max(100.0f, _tableScroll.Width - 4.0f);
         }
 
         /// <inheritdoc />
@@ -60,10 +104,13 @@ namespace FlaxEditor.Windows
         /// <param name="regionName">The profiler region name.</param>
         public void ShowRegion(string regionName)
         {
+            _lastStatusText = string.Empty;
+
             string apiName = FormatRendererType(GPUDevice.Instance != null ? GPUDevice.Instance.RendererType : RendererType.Unknown);
             Title = "Nvidia PerfSDK Metrics: " + regionName + " · " + apiName;
             UpdateView();
             ApplyWindowSize();
+            PerformLayout();
 
             // Controls default to Visible=true before first show; use IsHidden so undocked windows still open.
             if (IsHidden)
@@ -76,10 +123,15 @@ namespace FlaxEditor.Windows
             }
         }
 
-        static Float2 GetFloatingClientSize()
+        static Float2 GetFloatingClientSize(Float2 clientSize)
         {
             var dpi = (float)Platform.Dpi / 96.0f;
-            return MetricsWindowSize * dpi * Platform.CustomDpiScale;
+            return clientSize * dpi * Platform.CustomDpiScale;
+        }
+
+        Float2 GetFloatingClientSize()
+        {
+            return GetFloatingClientSize(Size);
         }
 
         void ApplyWindowSize()
@@ -88,7 +140,7 @@ namespace FlaxEditor.Windows
 
             if (ParentDockPanel is FloatWindowDockPanel floatPanel && floatPanel.Window?.Window != null)
             {
-                floatPanel.Window.Window.ClientSize = GetFloatingClientSize();
+                floatPanel.Window.Window.ClientSize = GetFloatingClientSize(MetricsWindowSize);
                 floatPanel.Window.PerformLayout();
                 PerformLayout();
             }
@@ -97,19 +149,15 @@ namespace FlaxEditor.Windows
         /// <summary>
         /// Refreshes the window contents from the active PerfSDK session.
         /// </summary>
-        public void UpdateViewPublic()
+        /// <param name="expandCustomGroup">When true, ensures the Custom group is expanded.</param>
+        public void UpdateViewPublic(bool expandCustomGroup = false)
         {
-            UpdateView();
+            UpdateView(expandCustomGroup);
         }
 
-        /// <inheritdoc />
-        public override void OnUpdate()
+        private void OnAddMetricClicked()
         {
-            if (RenderPerfTools.IsSessionActive)
-            {
-                RenderPerfTools.TickSession();
-                UpdateView();
-            }
+            PerfSdkAddMetricWindow.ShowPicker(Editor, this);
         }
 
         /// <inheritdoc />
@@ -119,9 +167,14 @@ namespace FlaxEditor.Windows
                 RenderPerfTools.CloseRegionProfiler();
         }
 
-        private void UpdateView()
+        private void UpdateView(bool expandCustomGroup = false)
         {
-            _statusLabel.Text = RenderPerfTools.StatusText;
+            string statusText = RenderPerfTools.StatusText;
+            if (!string.Equals(_lastStatusText, statusText, StringComparison.Ordinal))
+            {
+                _statusLabel.Text = statusText;
+                _lastStatusText = statusText ?? string.Empty;
+            }
 
             string regionName = RenderPerfTools.RegionName;
             float gpuTimeMs = RenderPerfTools.RegionGpuTimeMs;
@@ -131,9 +184,10 @@ namespace FlaxEditor.Windows
             TryGetLiveRegionStats(regionName, ref gpuTimeMs, ref drawCalls, ref triangles, ref vertices);
 
             _table.SetRegionStats(regionName, gpuTimeMs, drawCalls, triangles, vertices);
+
             string chipAreas = RenderPerfTools.ChipAreasText;
-            _table.SetChipAreasText(chipAreas);
-            _table.SetEmptyMessage(string.IsNullOrEmpty(chipAreas) ? RenderPerfTools.StatusText : "Collecting GPU samples...");
+            _table.SetChipAreasText(chipAreas, expandCustomGroup);
+            _table.SetEmptyMessage(string.IsNullOrEmpty(chipAreas) ? statusText : "Collecting GPU samples...");
         }
 
         private static unsafe void TryGetLiveRegionStats(string regionName, ref float gpuTimeMs, ref long drawCalls, ref long triangles, ref long vertices)
@@ -147,11 +201,11 @@ namespace FlaxEditor.Windows
 
             for (int i = 0; i < events.Length; i++)
             {
-                var e = events[i];
+                ref var e = ref events[i];
                 if (e.Name == null)
                     continue;
 
-                if (!string.Equals(new string(e.Name), regionName, StringComparison.Ordinal))
+                if (!String.Equals(regionName, new string(e.Name), StringComparison.Ordinal))
                     continue;
 
                 gpuTimeMs = e.Time;
@@ -192,12 +246,10 @@ namespace FlaxEditor.Windows
             private const float BarHeight = 14.0f;
             private const float ColumnGap = 6.0f;
             private const float GroupHeaderPadding = 8.0f;
-            private const float AreaLabelColumnWidth = 120.0f;
-            private const float ThroughputColumnStart = 138.0f;
+            private const float ValueColumnStart = GroupHeaderPadding;
             private const float BarTrackRatio = 0.11f;
             private const float PercentLabelWidth = 40.0f;
             private const float BarPercentGap = 4.0f;
-            private const float AreaNameTextOffset = 15.0f;
 
             private enum RowKind
             {
@@ -205,14 +257,27 @@ namespace FlaxEditor.Windows
                 Metric,
             }
 
+            private enum MetricDisplayFormat
+            {
+                Percent = 0,
+                Warps = 1,
+                Pixels = 2,
+                Bandwidth = 3,
+                Time = 4,
+                Counter = 5,
+            }
+
             private struct RowData
             {
                 public RowKind Kind;
                 public string Title;
-                public float Target;
-                public float Display;
+                public int MetricIndex;
+                public double Target;
+                public double Display;
                 public string Detail;
                 public bool HigherIsBetter;
+                public MetricDisplayFormat Format;
+                public bool ShowBar => Format != MetricDisplayFormat.Counter;
             }
 
             private struct GroupHeaderHit
@@ -225,18 +290,30 @@ namespace FlaxEditor.Windows
             private string _emptyMessage = "Collecting GPU samples...";
             private string _regionName = string.Empty;
             private string _regionStatsLine = string.Empty;
+            private string _lastRegionName = string.Empty;
+            private string _lastRegionStatsLine = string.Empty;
+            private float _lastLayoutHeight = -1.0f;
             private readonly System.Collections.Generic.HashSet<string> _collapsedGroups = new System.Collections.Generic.HashSet<string>();
             private readonly System.Collections.Generic.List<GroupHeaderHit> _groupHits = new System.Collections.Generic.List<GroupHeaderHit>();
 
             public void SetRegionStats(string regionName, float gpuTimeMs, long drawCalls, long triangles, long vertices)
             {
-                _regionName = regionName ?? string.Empty;
-                _regionStatsLine = string.Format(
+                regionName ??= string.Empty;
+                string statsLine = string.Format(
                     "GPU time: {0:0.000} ms   Draw calls: {1:#,0}   Triangles: {2:#,0}   Vertices: {3:#,0}",
                     gpuTimeMs,
                     drawCalls,
                     triangles,
                     vertices);
+
+                if (regionName == _lastRegionName && statsLine == _lastRegionStatsLine)
+                    return;
+
+                _regionName = regionName;
+                _regionStatsLine = statsLine;
+                _lastRegionName = regionName;
+                _lastRegionStatsLine = statsLine;
+                UpdateLayoutHeight();
             }
 
             public void SetEmptyMessage(string message)
@@ -245,13 +322,20 @@ namespace FlaxEditor.Windows
                     _emptyMessage = message;
             }
 
-            public void SetChipAreasText(string text)
+            public void SetChipAreasText(string text, bool expandCustomGroup = false)
             {
                 if (string.IsNullOrEmpty(text))
                 {
                     _rows = Array.Empty<RowData>();
+                    UpdateLayoutHeight();
                     return;
                 }
+
+                if (!expandCustomGroup && TryApplyValueUpdates(text))
+                    return;
+
+                if (expandCustomGroup)
+                    _collapsedGroups.Remove("Custom");
 
                 string[] lines = text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
                 var rows = new RowData[lines.Length];
@@ -273,28 +357,31 @@ namespace FlaxEditor.Windows
                         continue;
                     }
 
-                    if (parts.Length < 3 || !float.TryParse(parts[1], NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out float target))
+                    if (parts.Length < 3 || !double.TryParse(parts[1], NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out double target))
                         continue;
 
                     bool higherIsBetter = parts.Length >= 4 && parts[3] == "1";
-                    float display = target;
-                    for (int j = 0; j < _rows.Length; j++)
+                    var format = MetricDisplayFormat.Percent;
+                    if (parts.Length >= 5 && int.TryParse(parts[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out int formatCode) &&
+                        Enum.IsDefined(typeof(MetricDisplayFormat), formatCode))
                     {
-                        if (_rows[j].Kind == RowKind.Metric && _rows[j].Title == parts[0])
-                        {
-                            display = _rows[j].Display;
-                            break;
-                        }
+                        format = (MetricDisplayFormat)formatCode;
                     }
+
+                    int metricIndex = -1;
+                    if (parts.Length >= 6)
+                        int.TryParse(parts[5], NumberStyles.Integer, CultureInfo.InvariantCulture, out metricIndex);
 
                     rows[count++] = new RowData
                     {
                         Kind = RowKind.Metric,
                         Title = parts[0],
+                        MetricIndex = metricIndex,
                         Target = target,
-                        Display = display,
+                        Display = target,
                         Detail = parts[2],
                         HigherIsBetter = higherIsBetter,
+                        Format = format,
                     };
                 }
 
@@ -306,25 +393,134 @@ namespace FlaxEditor.Windows
                     Array.Copy(rows, trimmed, count);
                     _rows = trimmed;
                 }
+
+                UpdateLayoutHeight();
+            }
+
+            bool TryApplyValueUpdates(string text)
+            {
+                if (_rows.Length == 0)
+                    return false;
+
+                string[] lines = text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                int rowIndex = 0;
+
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    string[] parts = lines[i].Split('\t');
+                    if (parts.Length < 2)
+                        continue;
+
+                    if (parts[0] == "#GROUP")
+                    {
+                        if (rowIndex >= _rows.Length || _rows[rowIndex].Kind != RowKind.GroupHeader || _rows[rowIndex].Title != parts[1])
+                            return false;
+
+                        rowIndex++;
+                        continue;
+                    }
+
+                    if (parts.Length < 3 || !double.TryParse(parts[1], NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out double target))
+                        return false;
+
+                    if (rowIndex >= _rows.Length || _rows[rowIndex].Kind != RowKind.Metric)
+                        return false;
+
+                    int metricIndex = -1;
+                    if (parts.Length >= 6)
+                        int.TryParse(parts[5], NumberStyles.Integer, CultureInfo.InvariantCulture, out metricIndex);
+
+                    RowData row = _rows[rowIndex];
+                    if (metricIndex >= 0)
+                    {
+                        if (row.MetricIndex != metricIndex)
+                            return false;
+                    }
+                    else if (row.Title != parts[0])
+                    {
+                        return false;
+                    }
+
+                    bool higherIsBetter = parts.Length >= 4 && parts[3] == "1";
+                    var format = MetricDisplayFormat.Percent;
+                    if (parts.Length >= 5 && int.TryParse(parts[4], NumberStyles.Integer, CultureInfo.InvariantCulture, out int formatCode) &&
+                        Enum.IsDefined(typeof(MetricDisplayFormat), formatCode))
+                    {
+                        format = (MetricDisplayFormat)formatCode;
+                    }
+
+                    row.Target = target;
+                    row.Display = target;
+                    row.Detail = parts[2];
+                    row.HigherIsBetter = higherIsBetter;
+                    row.Format = format;
+                    if (metricIndex >= 0)
+                        row.MetricIndex = metricIndex;
+                    _rows[rowIndex] = row;
+                    rowIndex++;
+                }
+
+                if (rowIndex != _rows.Length)
+                    return false;
+
+                return true;
+            }
+
+            float GetValueColumnWidth(float contentWidth)
+            {
+                return contentWidth * BarTrackRatio + PercentLabelWidth + BarPercentGap;
+            }
+
+            float GetBarTrackWidth(float contentWidth, float valueColumnWidth)
+            {
+                return Math.Max(0.0f, valueColumnWidth - PercentLabelWidth - BarPercentGap);
+            }
+
+            void UpdateLayoutHeight()
+            {
+                float newHeight = ComputeContentHeight();
+                if (Math.Abs(newHeight - _lastLayoutHeight) < 0.5f)
+                    return;
+
+                _lastLayoutHeight = newHeight;
+                Height = newHeight;
+                Width = Math.Max(Width, 100.0f);
+            }
+
+            float ComputeContentHeight()
+            {
+                float y = 10.0f;
+                if (!string.IsNullOrEmpty(_regionName) || !string.IsNullOrEmpty(_regionStatsLine))
+                    y += FooterTopGap + FooterLineHeight * 2.0f + FooterBottomGap;
+
+                y += HeaderRowHeight;
+
+                if (_rows.Length == 0)
+                    return Math.Max(y + RowHeight + 10.0f, 100.0f);
+
+                bool currentGroupCollapsed = false;
+                for (int i = 0; i < _rows.Length; i++)
+                {
+                    RowData row = _rows[i];
+                    if (row.Kind == RowKind.GroupHeader)
+                    {
+                        currentGroupCollapsed = _collapsedGroups.Contains(row.Title);
+                        y += GroupHeaderHeight;
+                        continue;
+                    }
+
+                    if (currentGroupCollapsed)
+                        continue;
+
+                    y += RowHeight;
+                }
+
+                return Math.Max(y + 10.0f, 100.0f);
             }
 
             /// <inheritdoc />
             public override void Update(float deltaTime)
             {
-                if (Visible && _rows.Length > 0)
-                {
-                    float step = Mathf.Saturate(deltaTime * 6.0f);
-                    for (int i = 0; i < _rows.Length; i++)
-                    {
-                        if (_rows[i].Kind != RowKind.Metric)
-                            continue;
-
-                        RowData row = _rows[i];
-                        row.Display = Mathf.Lerp(row.Display, row.Target, step);
-                        _rows[i] = row;
-                    }
-                }
-
                 base.Update(deltaTime);
             }
 
@@ -335,16 +531,17 @@ namespace FlaxEditor.Windows
 
                 var style = Style.Current;
                 float contentWidth = Width;
-                float areaWidth = AreaLabelColumnWidth;
-                float barTrackWidth = contentWidth * BarTrackRatio;
-                float barWidth = barTrackWidth + PercentLabelWidth + BarPercentGap;
-                float xBar = ThroughputColumnStart;
-                float xDetail = xBar + barWidth + ColumnGap;
+                float valueColumnWidth = GetValueColumnWidth(contentWidth);
+                float barTrackWidth = GetBarTrackWidth(contentWidth, valueColumnWidth);
+                float xBar = ValueColumnStart;
+                float xDetail = xBar + valueColumnWidth + ColumnGap;
                 float detailWidth = Math.Max(0.0f, contentWidth - xDetail);
 
                 float y = 10;
                 y = DrawFooter(style, y, contentWidth);
-                DrawHeader(style, y, areaWidth, xBar, barWidth, xDetail, detailWidth);
+                float headerTop = y;
+                DrawHeader(style, headerTop, xBar, valueColumnWidth, xDetail, detailWidth, contentWidth);
+                y = headerTop + HeaderRowHeight;
 
                 if (_rows.Length == 0)
                 {
@@ -378,12 +575,12 @@ namespace FlaxEditor.Windows
                             Render2D.FillRectangle(hoverRect, style.BackgroundHighlighted * 0.35f);
                         }
 
-                        var areaRect = new Rectangle(AreaNameTextOffset, y, areaWidth - AreaNameTextOffset, RowHeight);
-                        Render2D.DrawText(style.FontMedium, row.Title, areaRect, style.Foreground, TextAlignment.Near, TextAlignment.Center);
+                        if (row.ShowBar)
+                            DrawThroughputBar(style, xBar, y, barTrackWidth, row);
+                        else
+                            DrawCounterValue(style, xBar, y, valueColumnWidth, row);
 
-                        DrawThroughputBar(style, xBar, y, barTrackWidth, row);
-
-                        var detailRect = new Rectangle(xDetail, y, detailWidth, RowHeight);
+                        var detailRect = new Rectangle(xDetail, y, Math.Max(detailWidth, MeasureDetailTextWidth(style, row.Detail) + 4.0f), RowHeight);
                         Render2D.DrawText(style.FontMedium, row.Detail, detailRect, style.Foreground * 0.85f, TextAlignment.Near, TextAlignment.Center);
                         y += RowHeight;
                     }
@@ -404,6 +601,7 @@ namespace FlaxEditor.Windows
                             string title = _groupHits[i].Title;
                             if (!_collapsedGroups.Remove(title))
                                 _collapsedGroups.Add(title);
+                            UpdateLayoutHeight();
                             return true;
                         }
                     }
@@ -451,14 +649,21 @@ namespace FlaxEditor.Windows
                 return statsRect.Bottom + FooterBottomGap;
             }
 
-            private static void DrawHeader(Style style, float top, float areaWidth, float xBar, float barWidth, float xDetail, float detailWidth)
+            private static void DrawHeader(Style style, float top, float xBar, float valueColumnWidth, float xDetail, float detailWidth, float contentWidth)
             {
-                var headerBg = new Rectangle(0, top, xDetail + detailWidth, HeaderRowHeight);
+                var headerBg = new Rectangle(0, top, contentWidth, HeaderRowHeight);
                 Render2D.FillRectangle(headerBg, style.LightBackground);
 
-                Render2D.DrawText(style.FontMedium, "Area", new Rectangle(GroupHeaderPadding, top, areaWidth - GroupHeaderPadding, HeaderRowHeight), style.Foreground, TextAlignment.Near, TextAlignment.Center);
-                Render2D.DrawText(style.FontMedium, "Throughput", new Rectangle(xBar, top, barWidth, HeaderRowHeight), style.Foreground, TextAlignment.Near, TextAlignment.Center);
+                Render2D.DrawText(style.FontMedium, "Throughput", new Rectangle(xBar, top, valueColumnWidth, HeaderRowHeight), style.Foreground, TextAlignment.Near, TextAlignment.Center);
                 Render2D.DrawText(style.FontMedium, "Metrics", new Rectangle(xDetail, top, detailWidth, HeaderRowHeight), style.Foreground, TextAlignment.Near, TextAlignment.Center);
+            }
+
+            private static float MeasureDetailTextWidth(Style style, string detail)
+            {
+                if (string.IsNullOrEmpty(detail))
+                    return 0.0f;
+
+                return style.FontMedium.MeasureText(detail).X;
             }
 
             private static void DrawThroughputBar(Style style, float x, float y, float barTrackWidth, RowData row)
@@ -467,7 +672,7 @@ namespace FlaxEditor.Windows
                 var bgRect = new Rectangle(x, barY, barTrackWidth, BarHeight);
                 Render2D.FillRectangle(bgRect, style.Background * 1.2f);
 
-                float fill = Mathf.Clamp(row.Display, 0.0f, 100.0f) * 0.01f;
+                float fill = Mathf.Clamp((float)row.Display, 0.0f, 100.0f) * 0.01f;
                 if (fill > 0.001f)
                 {
                     var fillRect = new Rectangle(x, barY, barTrackWidth * fill, BarHeight);
@@ -477,7 +682,24 @@ namespace FlaxEditor.Windows
                 Render2D.DrawRectangle(bgRect, style.Foreground * 0.15f);
 
                 var percentRect = new Rectangle(x + barTrackWidth + BarPercentGap, y, PercentLabelWidth, RowHeight);
-                Render2D.DrawText(style.FontMedium, Mathf.RoundToInt(row.Display) + "%", percentRect, style.Foreground, TextAlignment.Far, TextAlignment.Center);
+                Render2D.DrawText(style.FontMedium, Mathf.RoundToInt((float)row.Display) + "%", percentRect, style.Foreground, TextAlignment.Far, TextAlignment.Center);
+            }
+
+            private static void DrawCounterValue(Style style, float x, float y, float width, RowData row)
+            {
+                var valueRect = new Rectangle(x, y, width, RowHeight);
+                Render2D.DrawText(style.FontMedium, FormatCounterValue(row.Display), valueRect, style.Foreground, TextAlignment.Near, TextAlignment.Center);
+            }
+
+            private static string FormatCounterValue(double value)
+            {
+                if (double.IsNaN(value) || double.IsInfinity(value))
+                    return "n/a";
+
+                if (Math.Abs(value) >= 1000.0 || Math.Abs(value - Math.Round(value)) < 0.01)
+                    return value.ToString("#,0", CultureInfo.InvariantCulture);
+
+                return value.ToString("0.####", CultureInfo.InvariantCulture);
             }
 
             private static Color GetBarColor(float value, bool higherIsBetter, Style style)

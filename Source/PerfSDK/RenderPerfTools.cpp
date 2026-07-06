@@ -28,6 +28,7 @@ namespace
 
 #if COMPILE_WITH_RENDER_PERF_NVPERF
     static PerfSdkHud Hud;
+    static String AvailableMetricsText;
 
     static void OnProfilerGpuEventBegin(const Char* name, int32 depth, int32 index, GPUContext* context)
     {
@@ -250,6 +251,9 @@ void RenderPerfTools::CloseRegionProfiler()
     RegionTriangles = 0;
     RegionVertices = 0;
     DesignerMetrics.Clear();
+#if COMPILE_WITH_RENDER_PERF_NVPERF
+    AvailableMetricsText.Clear();
+#endif
 }
 
 void RenderPerfTools::ProcessGpuFrameIfNeeded(GPUContext* context)
@@ -260,6 +264,7 @@ void RenderPerfTools::ProcessGpuFrameIfNeeded(GPUContext* context)
     if (!SessionActive || !Hud.IsActive())
         return;
     Hud.UpdateSessionStatus();
+    Hud.PollRangeMetrics();
     Hud.GetDesignerMetrics(DesignerMetrics);
 #endif
 }
@@ -297,5 +302,92 @@ void RenderPerfTools::OnGpuFrameEnd()
     if (SessionActive)
         Hud.OnFrameEnd();
 #endif
+}
+
+String RenderPerfTools::GetAvailableMetricsText()
+{
+#if COMPILE_WITH_RENDER_PERF_NVPERF
+    return AvailableMetricsText;
+#else
+    return String::Empty;
+#endif
+}
+
+bool RenderPerfTools::TryLoadAvailableMetrics()
+{
+#if COMPILE_WITH_RENDER_PERF_NVPERF
+    if (!SessionActive || !Hud.IsActive())
+    {
+        AvailableMetricsText = TEXT("Open a GPU profiler region first.");
+        return false;
+    }
+    AvailableMetricsText = Hud.LoadAvailableMetricsText();
+    return !AvailableMetricsText.IsEmpty();
+#else
+    ErrorText = TEXT("PerfSDK plugin was built without NVIDIA Perf SDK support.");
+    return false;
+#endif
+}
+
+bool RenderPerfTools::TryAddUserMetric(const String& metricName)
+{
+#if COMPILE_WITH_RENDER_PERF_NVPERF
+    if (!SessionActive || !Hud.IsActive())
+    {
+        ErrorText = TEXT("Open a GPU profiler region first.");
+        return false;
+    }
+    String error;
+    if (!Hud.TryAddUserMetric(metricName, error))
+    {
+        ErrorText = error;
+        return false;
+    }
+    ErrorText.Clear();
+    return true;
+#else
+    ErrorText = TEXT("PerfSDK plugin was built without NVIDIA Perf SDK support.");
+    return false;
+#endif
+}
+
+bool RenderPerfTools::TryRemoveUserMetric(const String& metricName)
+{
+#if COMPILE_WITH_RENDER_PERF_NVPERF
+    if (!SessionActive || !Hud.IsActive())
+    {
+        ErrorText = TEXT("Open a GPU profiler region first.");
+        return false;
+    }
+    String error;
+    if (!Hud.TryRemoveUserMetric(metricName, error))
+    {
+        ErrorText = error;
+        return false;
+    }
+    ErrorText.Clear();
+    return true;
+#else
+    ErrorText = TEXT("PerfSDK plugin was built without NVIDIA Perf SDK support.");
+    return false;
+#endif
+}
+
+String RenderPerfTools::GetUserMetricNamesText()
+{
+#if COMPILE_WITH_RENDER_PERF_NVPERF
+    if (SessionActive && Hud.IsActive())
+        return Hud.GetUserMetricNamesText();
+#endif
+    return String::Empty;
+}
+
+String RenderPerfTools::GetActiveMetricNamesText()
+{
+#if COMPILE_WITH_RENDER_PERF_NVPERF
+    if (SessionActive && Hud.IsActive())
+        return Hud.GetActiveMetricNamesText();
+#endif
+    return String::Empty;
 }
 

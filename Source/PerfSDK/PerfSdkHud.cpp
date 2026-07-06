@@ -149,6 +149,7 @@ namespace
         Pixels,
         Bandwidth,
         Time,
+        Counter,
     };
 
     static std::string ToUtf8Ascii(const String& s)
@@ -174,6 +175,101 @@ namespace
         float BarScale;
         bool HigherIsBetter;
     };
+
+    // Owned copy used for built-in and user-added metrics in the active configuration.
+    struct RangeMetricDef
+    {
+        String GroupName;
+        String AreaName;
+        std::string MetricName;
+        String MetricLabel;
+        ChipMetricFormat Format;
+        float BarScale;
+        bool HigherIsBetter;
+        bool IsUserAdded = false;
+    };
+
+    struct ActiveRangeMetric
+    {
+        RangeMetricDef Def;
+        NVPW_MetricEvalRequest Request;
+    };
+
+    static RangeMetricDef ToOwnedDef(const RangeAreaDefinition& src)
+    {
+        RangeMetricDef def;
+        def.GroupName = src.GroupName;
+        def.AreaName = src.AreaName;
+        def.MetricName = src.MetricName;
+        def.MetricLabel = src.MetricLabel;
+        def.Format = src.Format;
+        def.BarScale = src.BarScale;
+        def.HigherIsBetter = src.HigherIsBetter;
+        def.IsUserAdded = false;
+        return def;
+    }
+
+    static String MakeDisplayNameFromMetricName(const char* metricName)
+    {
+        if (!metricName || !metricName[0])
+            return TEXT("Metric");
+
+        String result(metricName);
+        result.Replace(TEXT("__"), TEXT(" "));
+        result.Replace(TEXT("_"), TEXT(" "));
+        result.Replace(TEXT("."), TEXT(" "));
+        while (result.Contains(TEXT("  ")))
+            result.Replace(TEXT("  "), TEXT(" "));
+        return result;
+    }
+
+    static ChipMetricFormat InferMetricFormat(const std::string& metricName)
+    {
+        if (metricName.find("time") != std::string::npos || metricName.find("duration") != std::string::npos)
+            return ChipMetricFormat::Time;
+        if (metricName.find("bandwidth") != std::string::npos || metricName.find("byte") != std::string::npos)
+            return ChipMetricFormat::Bandwidth;
+        if (metricName.find("warp") != std::string::npos && metricName.find(".pct") == std::string::npos)
+            return ChipMetricFormat::Warps;
+        return ChipMetricFormat::Percent;
+    }
+
+    static ChipMetricFormat ResolveUserMetricFormat(NVPW_MetricsEvaluator* evaluator, const std::string& metricName)
+    {
+        if (evaluator)
+        {
+            NVPW_MetricType metricType;
+            size_t metricIndex = 0;
+            if (nv::perf::GetMetricTypeAndIndex(evaluator, metricName.c_str(), metricType, metricIndex))
+            {
+                if (metricType == NVPW_METRIC_TYPE_COUNTER)
+                    return ChipMetricFormat::Counter;
+                if (metricType == NVPW_METRIC_TYPE_RATIO || metricType == NVPW_METRIC_TYPE_THROUGHPUT)
+                    return ChipMetricFormat::Percent;
+            }
+        }
+        return InferMetricFormat(metricName);
+    }
+
+    static bool InferHigherIsBetter(const std::string& metricName)
+    {
+        return metricName.find("hit_rate") != std::string::npos ||
+               metricName.find("_rate.pct") != std::string::npos;
+    }
+
+    static RangeMetricDef MakeUserMetricDef(NVPW_MetricsEvaluator* evaluator, const std::string& metricName)
+    {
+        RangeMetricDef def;
+        def.GroupName = TEXT("Custom");
+        def.MetricName = metricName;
+        def.AreaName = MakeDisplayNameFromMetricName(metricName.c_str());
+        def.MetricLabel = def.AreaName;
+        def.Format = ResolveUserMetricFormat(evaluator, metricName);
+        def.BarScale = def.Format == ChipMetricFormat::Time ? 5.0f : 100.0f;
+        def.HigherIsBetter = InferHigherIsBetter(metricName);
+        def.IsUserAdded = true;
+        return def;
+    }
 
     static const RangeAreaDefinition gRangeAreaDefinitions[] =
     {
@@ -215,6 +311,7 @@ namespace
 
     static const Char* gChipAreaGroupOrder[] =
     {
+        TEXT("Custom"),
         TEXT("GPU Engines"),
         TEXT("Workload"),
         TEXT("Shaders"),
@@ -258,9 +355,9 @@ namespace
         std::unique_ptr<nv::perf::MetricsEvaluator> metricsEvaluator;
         NVPW_MetricsEvaluator* metricsEvaluatorRaw = nullptr;
         nv::perf::CounterConfiguration rangeCounterConfig;
-        std::vector<int32_t> activeRangeDefs;                  // indices into gRangeAreaDefinitions
-        std::vector<NVPW_MetricEvalRequest> rangeEvalRequests; // aligned with activeRangeDefs
-        std::vector<double> rangeMetricValues;                 // aligned with activeRangeDefs
+        std::vector<ActiveRangeMetric> activeMetrics;
+        std::vector<std::string> userMetricNames;
+        std::vector<double> rangeMetricValues;
 
         bool rangeSessionActive = false;
         bool rangeDataValid = false;
@@ -295,6 +392,16 @@ namespace
         uint32_t dbgDecodeCallCount = 0;    // DecodeCounters calls (poll)
         bool dbgLoggedFirstPush = false;
     };
+
+    static bool MetricNameAlreadyActive(const PerfSdkHudImpl& impl, const char* metricName)
+    {
+        for (const ActiveRangeMetric& metric : impl.activeMetrics)
+        {
+            if (metric.Def.MetricName == metricName)
+                return true;
+        }
+        return false;
+    }
 
     // Captured from the most recent NvPerf ERR log during BeginSession (cleared at each attempt).
     static String gPendingNvPerfSessionError;
@@ -434,6 +541,8 @@ namespace
                 return 0.0f;
             return NormalizeMetricPercent(ms / barScale * 100.0);
         }
+        case ChipMetricFormat::Counter:
+            return 0.0f;
         default:
             if (barScale <= 0.0f)
                 return 0.0f;
@@ -455,6 +564,15 @@ namespace
             return String::Format(TEXT("{0}: {1:.2f} GB/s"), label, (float)rawValue);
         case ChipMetricFormat::Time:
             return String::Format(TEXT("{0}: {1:.4f} ms"), label, (float)(rawValue / 1.0e6));
+        case ChipMetricFormat::Counter:
+        {
+            if (std::isnan(rawValue) || std::isinf(rawValue))
+                return String::Format(TEXT("{0}: n/a"), label);
+            const double absValue = std::fabs(rawValue);
+            if (absValue >= 1000.0 || std::floor(rawValue + 0.5) == rawValue)
+                return String::Format(TEXT("{0}: {1}"), label, (int64)rawValue);
+            return String::Format(TEXT("{0}: {1:.4f}"), label, (float)rawValue);
+        }
         default:
             return String::Format(TEXT("{0}: {1:.1f}"), label, (float)rawValue);
         }
@@ -570,6 +688,123 @@ namespace
     }
 
     // Builds the metrics evaluator + counter configuration (shared logic; backend only changes the factory calls).
+    static bool BuildRangeCounterConfiguration(PerfSdkHudImpl& impl, NVPW_MetricsEvaluator* pMetricsEvaluator, String& statusText)
+    {
+        NVPW_RawCounterConfig* pRawCounterConfig = nullptr;
+        switch (impl.backend)
+        {
+#if GRAPHICS_API_DIRECTX11
+        case PerfSdkBackend::D3D11:  pRawCounterConfig = nv::perf::profiler::D3D11CreateRawCounterConfig(impl.chipName.c_str()); break;
+#endif
+#if GRAPHICS_API_DIRECTX12
+        case PerfSdkBackend::D3D12:  pRawCounterConfig = nv::perf::profiler::D3D12CreateRawCounterConfig(impl.chipName.c_str()); break;
+#endif
+#if GRAPHICS_API_VULKAN
+        case PerfSdkBackend::Vulkan: pRawCounterConfig = nv::perf::profiler::VulkanCreateRawCounterConfig(impl.chipName.c_str()); break;
+#endif
+        }
+        if (!pRawCounterConfig)
+        {
+            statusText = TEXT("Nsight Perf: CreateRawCounterConfig failed.");
+            return false;
+        }
+
+        nv::perf::MetricsConfigBuilder configBuilder;
+        if (!configBuilder.Initialize(pMetricsEvaluator, pRawCounterConfig, impl.chipName.c_str()))
+        {
+            statusText = TEXT("Nsight Perf: MetricsConfigBuilder init failed.");
+            return false;
+        }
+
+        impl.activeMetrics.clear();
+
+        // User-added metrics first so they keep counter slots when the budget is tight.
+        for (const std::string& userMetricName : impl.userMetricNames)
+        {
+            if (MetricNameAlreadyActive(impl, userMetricName.c_str()))
+                continue;
+            NVPW_MetricEvalRequest request{};
+            if (!nv::perf::ToMetricEvalRequest(pMetricsEvaluator, userMetricName.c_str(), request))
+                continue;
+            if (!configBuilder.AddMetric(userMetricName.c_str()))
+                continue;
+            ActiveRangeMetric metric;
+            metric.Def = MakeUserMetricDef(pMetricsEvaluator, userMetricName);
+            metric.Request = request;
+            impl.activeMetrics.push_back(std::move(metric));
+        }
+
+        for (int32_t i = 0; i < (int32_t)(sizeof(gRangeAreaDefinitions) / sizeof(gRangeAreaDefinitions[0])); i++)
+        {
+            NVPW_MetricEvalRequest request{};
+            if (!nv::perf::ToMetricEvalRequest(pMetricsEvaluator, gRangeAreaDefinitions[i].MetricName, request))
+                continue;
+            if (!configBuilder.AddMetric(gRangeAreaDefinitions[i].MetricName))
+                continue;
+            ActiveRangeMetric metric;
+            metric.Def = ToOwnedDef(gRangeAreaDefinitions[i]);
+            metric.Request = request;
+            impl.activeMetrics.push_back(std::move(metric));
+        }
+
+        if (impl.activeMetrics.empty())
+        {
+            statusText = TEXT("Nsight Perf: no supported range metrics on this GPU.");
+            return false;
+        }
+
+        if (!nv::perf::CreateConfiguration(configBuilder, impl.rangeCounterConfig))
+        {
+            statusText = TEXT("Nsight Perf: range counter configuration failed.");
+            return false;
+        }
+
+        impl.rangePassesPerSample = impl.rangeCounterConfig.numPasses > 0 ? impl.rangeCounterConfig.numPasses : 1;
+        impl.rangeMetricValues.assign(impl.activeMetrics.size(), 0.0);
+        return true;
+    }
+
+    static void EndRangeSession(PerfSdkHudImpl& impl);
+    static bool BeginRangeSession(PerfSdkHudImpl& impl);
+
+    static bool RebuildRangeCounterConfiguration(PerfSdkHudImpl& impl, String& statusText)
+    {
+        if (!impl.metricsEvaluatorRaw)
+        {
+            statusText = TEXT("Nsight Perf: metrics evaluator is not ready.");
+            return false;
+        }
+
+        const bool wasSessionActive = impl.rangeSessionActive;
+        EndRangeSession(impl);
+        impl.rangeDataValid = false;
+        impl.rangeMeasurementCount = 0;
+        for (double& v : impl.rangeMetricValues)
+            v = 0.0;
+
+        if (!BuildRangeCounterConfiguration(impl, impl.metricsEvaluatorRaw, statusText))
+            return false;
+
+        if (wasSessionActive && impl.regionProfilingActive)
+        {
+#if GRAPHICS_API_DIRECTX11
+            if (impl.backend == PerfSdkBackend::D3D11)
+            {
+                if (!BeginRangeSession(impl))
+                {
+                    NoteBeginRangeSessionFailed(impl);
+                    return false;
+                }
+            }
+            else
+#endif
+            {
+                impl.pendingSessionBegin = true;
+            }
+        }
+        return true;
+    }
+
     static bool InitRangeMetrics(PerfSdkHudImpl& impl, String& statusText)
     {
         const char* chip = impl.chipName.c_str();
@@ -615,59 +850,7 @@ namespace
         impl.metricsEvaluator = std::make_unique<nv::perf::MetricsEvaluator>(pMetricsEvaluator, std::move(scratchBuffer));
         impl.metricsEvaluatorRaw = pMetricsEvaluator;
 
-        NVPW_RawCounterConfig* pRawCounterConfig = nullptr;
-        switch (impl.backend)
-        {
-#if GRAPHICS_API_DIRECTX11
-        case PerfSdkBackend::D3D11:  pRawCounterConfig = nv::perf::profiler::D3D11CreateRawCounterConfig(chip); break;
-#endif
-#if GRAPHICS_API_DIRECTX12
-        case PerfSdkBackend::D3D12:  pRawCounterConfig = nv::perf::profiler::D3D12CreateRawCounterConfig(chip); break;
-#endif
-#if GRAPHICS_API_VULKAN
-        case PerfSdkBackend::Vulkan: pRawCounterConfig = nv::perf::profiler::VulkanCreateRawCounterConfig(chip); break;
-#endif
-        }
-        if (!pRawCounterConfig)
-        {
-            statusText = TEXT("Nsight Perf: CreateRawCounterConfig failed.");
-            return false;
-        }
-
-        nv::perf::MetricsConfigBuilder configBuilder;
-        if (!configBuilder.Initialize(pMetricsEvaluator, pRawCounterConfig, chip))
-        {
-            statusText = TEXT("Nsight Perf: MetricsConfigBuilder init failed.");
-            return false;
-        }
-
-        // Add only metrics that exist on this chip, keeping defs/requests aligned.
-        impl.activeRangeDefs.clear();
-        impl.rangeEvalRequests.clear();
-        for (int32_t i = 0; i < (int32_t)(sizeof(gRangeAreaDefinitions) / sizeof(gRangeAreaDefinitions[0])); i++)
-        {
-            NVPW_MetricEvalRequest request{};
-            if (!nv::perf::ToMetricEvalRequest(pMetricsEvaluator, gRangeAreaDefinitions[i].MetricName, request))
-                continue;
-            if (!configBuilder.AddMetric(gRangeAreaDefinitions[i].MetricName))
-                continue;
-            impl.activeRangeDefs.push_back(i);
-            impl.rangeEvalRequests.push_back(request);
-        }
-        if (impl.activeRangeDefs.empty())
-        {
-            statusText = TEXT("Nsight Perf: no supported range metrics on this GPU.");
-            return false;
-        }
-
-        if (!nv::perf::CreateConfiguration(configBuilder, impl.rangeCounterConfig))
-        {
-            statusText = TEXT("Nsight Perf: range counter configuration failed.");
-            return false;
-        }
-        impl.rangePassesPerSample = impl.rangeCounterConfig.numPasses > 0 ? impl.rangeCounterConfig.numPasses : 1;
-        impl.rangeMetricValues.assign(impl.activeRangeDefs.size(), 0.0);
-        return true;
+        return BuildRangeCounterConfiguration(impl, pMetricsEvaluator, statusText);
     }
 
 #if GRAPHICS_API_DIRECTX11
@@ -994,7 +1177,7 @@ namespace
         impl.dbgDecodeCallCount = 0;
         impl.dbgLoggedFirstPush = false;
         LOG(Info, "[PerfSDK] BeginRangeSession OK ({0}) passesPerSample={1} metrics={2}.",
-            BackendName(impl.backend), (int32)impl.rangePassesPerSample, (int32)impl.activeRangeDefs.size());
+            BackendName(impl.backend), (int32)impl.rangePassesPerSample, (int32)impl.activeMetrics.size());
 
         impl.rangeSessionActive = true;
         impl.sessionBeginAttempts = 0;
@@ -1013,9 +1196,14 @@ namespace
         return true;
     }
 
+    static bool IsUsableMetricValue(double value)
+    {
+        return !std::isnan(value) && !std::isinf(value);
+    }
+
     static void EvaluateRange(PerfSdkHudImpl& impl, const std::vector<uint8_t>& counterDataImage)
     {
-        if (counterDataImage.empty() || impl.rangeEvalRequests.empty() || !impl.metricsEvaluatorRaw)
+        if (counterDataImage.empty() || impl.activeMetrics.empty() || !impl.metricsEvaluatorRaw)
             return;
 
         const uint8_t* image = counterDataImage.data();
@@ -1027,24 +1215,101 @@ namespace
         if (numRanges == 0)
             return;
 
-        // We push a single range per pass, so range 0 holds the clicked region.
-        std::vector<double> values(impl.rangeEvalRequests.size(), 0.0);
-        if (!nv::perf::EvaluateToGpuValues(
-                impl.metricsEvaluatorRaw,
-                image,
-                imageSize,
-                0,
-                impl.rangeEvalRequests.size(),
-                impl.rangeEvalRequests.data(),
-                values.data()))
+        std::vector<NVPW_MetricEvalRequest> requests;
+        requests.reserve(impl.activeMetrics.size());
+        for (const ActiveRangeMetric& metric : impl.activeMetrics)
+            requests.push_back(metric.Request);
+
+        if (impl.rangeMetricValues.size() != requests.size())
+            impl.rangeMetricValues.assign(requests.size(), 0.0);
+
+        std::vector<uint8_t> updated(requests.size(), 0);
+        size_t successCount = 0;
+
+        // Prefer batch evaluation on each range; merged counter data can land on any range index.
+        for (size_t rangeIndex = 0; rangeIndex < numRanges; rangeIndex++)
+        {
+            std::vector<double> batchValues(requests.size(), 0.0);
+            if (!nv::perf::EvaluateToGpuValues(
+                    impl.metricsEvaluatorRaw,
+                    image,
+                    imageSize,
+                    rangeIndex,
+                    requests.size(),
+                    requests.data(),
+                    batchValues.data()))
+            {
+                continue;
+            }
+
+            for (size_t i = 0; i < batchValues.size(); i++)
+            {
+                if (!IsUsableMetricValue(batchValues[i]))
+                    continue;
+                impl.rangeMetricValues[i] = batchValues[i];
+                updated[i] = 1;
+                successCount++;
+            }
+        }
+
+        // Per-metric fallback across all ranges for anything the batch pass missed.
+        for (size_t i = 0; i < requests.size(); i++)
+        {
+            if (updated[i])
+                continue;
+
+            for (size_t rangeIndex = 0; rangeIndex < numRanges; rangeIndex++)
+            {
+                double value = impl.rangeMetricValues[i];
+                if (nv::perf::EvaluateToGpuValues(
+                        impl.metricsEvaluatorRaw,
+                        image,
+                        imageSize,
+                        rangeIndex,
+                        1,
+                        &requests[i],
+                        &value) &&
+                    IsUsableMetricValue(value))
+                {
+                    impl.rangeMetricValues[i] = value;
+                    updated[i] = 1;
+                    successCount++;
+                    break;
+                }
+            }
+        }
+
+        if (successCount == 0)
             return;
 
-        impl.rangeMetricValues = std::move(values);
         impl.rangeDataValid = true;
         impl.rangeMeasurementCount++;
     }
 
-    static void RangeDecodeAtFrameEnd(PerfSdkHudImpl& impl)
+    static NVPW_Submetric DefaultSubmetricForMetricType(NVPW_MetricType metricType)
+    {
+        switch (metricType)
+        {
+        case NVPW_METRIC_TYPE_RATIO:
+            return NVPW_SUBMETRIC_RATIO;
+        case NVPW_METRIC_TYPE_THROUGHPUT:
+            return NVPW_SUBMETRIC_PCT_OF_PEAK_SUSTAINED_ELAPSED;
+        default:
+            return NVPW_SUBMETRIC_NONE;
+        }
+    }
+
+    static std::string BuildDefaultMetricEvalName(NVPW_MetricsEvaluator* evaluator, NVPW_MetricType metricType, size_t metricIndex)
+    {
+        NVPW_MetricEvalRequest request{};
+        request.metricIndex = metricIndex;
+        request.metricType = static_cast<uint8_t>(metricType);
+        request.rollupOp = static_cast<uint8_t>(NVPW_ROLLUP_OP_AVG);
+        request.submetric = static_cast<uint8_t>(DefaultSubmetricForMetricType(metricType));
+        return nv::perf::ToString(evaluator, request);
+    }
+
+    static void PollRangeMetricsInternal(PerfSdkHudImpl& impl)
     {
         if (!impl.rangeSessionActive)
             return;
@@ -1086,6 +1351,13 @@ namespace
         }
     }
 
+}
+
+void PerfSdkHud::PollRangeMetrics()
+{
+    if (!_active || !_impl)
+        return;
+    PollRangeMetricsInternal(*static_cast<PerfSdkHudImpl*>(_impl));
 }
 
 bool PerfSdkHud::TryInitialize(GPUDevice* device, GPUAdapter* adapter, GPUContext* context)
@@ -1343,7 +1615,7 @@ void PerfSdkHud::OnFrameEnd()
     }
 
     // Decode whatever is ready (all backends; never blocks, re-arms the next cycle automatically).
-    RangeDecodeAtFrameEnd(*impl);
+    PollRangeMetricsInternal(*impl);
 }
 
 void PerfSdkHud::OnProfilerGpuEventBegin(const Char* name, int32 depth, int32 index, GPUContext* context)
@@ -1506,13 +1778,13 @@ void PerfSdkHud::GetDesignerMetrics(Array<RenderPerfTools::DesignerGpuMetric, In
     auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
     if (!impl->rangeDataValid)
         return;
-    for (size_t k = 0; k < impl->activeRangeDefs.size(); k++)
+    for (size_t k = 0; k < impl->activeMetrics.size(); k++)
     {
-        const RangeAreaDefinition& def = gRangeAreaDefinitions[impl->activeRangeDefs[k]];
+        const RangeMetricDef& def = impl->activeMetrics[k].Def;
         const double rawValue = k < impl->rangeMetricValues.size() ? impl->rangeMetricValues[k] : 0.0;
         RenderPerfTools::DesignerGpuMetric metric;
         metric.Title = def.AreaName;
-        metric.Hint = FormatMetricDetail(def.MetricLabel, def.Format, rawValue);
+        metric.Hint = FormatMetricDetail(def.MetricLabel.Get(), def.Format, rawValue);
         metric.Value = ComputeBarValue(def.Format, def.BarScale, rawValue);
         metric.HigherIsBetter = def.HigherIsBetter;
         metrics.Add(metric);
@@ -1530,10 +1802,10 @@ String PerfSdkHud::GetChipAreasText() const
     for (const Char* groupName : gChipAreaGroupOrder)
     {
         bool wroteGroup = false;
-        for (size_t k = 0; k < impl->activeRangeDefs.size(); k++)
+        for (size_t k = 0; k < impl->activeMetrics.size(); k++)
         {
-            const RangeAreaDefinition& def = gRangeAreaDefinitions[impl->activeRangeDefs[k]];
-            if (String(def.GroupName) != groupName)
+            const RangeMetricDef& def = impl->activeMetrics[k].Def;
+            if (def.GroupName != groupName)
                 continue;
             if (!wroteGroup)
             {
@@ -1545,7 +1817,7 @@ String PerfSdkHud::GetChipAreasText() const
             const float bar = hasData ? ComputeBarValue(def.Format, def.BarScale, rawValue) : 0.0f;
             String detail;
             if (hasData)
-                detail = FormatMetricDetail(def.MetricLabel, def.Format, rawValue);
+                detail = FormatMetricDetail(def.MetricLabel.Get(), def.Format, rawValue);
             else if (!impl->rangeSessionActive)
             {
                 if (!impl->lastSessionError.IsEmpty())
@@ -1559,8 +1831,182 @@ String PerfSdkHud::GetChipAreasText() const
                 detail = TEXT("Waiting for region PushRange (Play + double-click GPU region)");
             else
                 detail = TEXT("Collecting region samples...");
-            sb.AppendFormat(TEXT("{0}\t{1:.1f}\t{2}\t{3}\n"), def.AreaName, bar, detail, def.HigherIsBetter ? 1 : 0);
+            if (def.Format == ChipMetricFormat::Counter)
+                sb.AppendFormat(TEXT("{0}\t{1:.6f}\t{2}\t{3}\t{4}\t{5}\n"), def.AreaName, rawValue, detail, def.HigherIsBetter ? 1 : 0, static_cast<int>(def.Format), (int32)k);
+            else
+                sb.AppendFormat(TEXT("{0}\t{1:.1f}\t{2}\t{3}\t{4}\t{5}\n"), def.AreaName, bar, detail, def.HigherIsBetter ? 1 : 0, static_cast<int>(def.Format), (int32)k);
         }
+    }
+    return sb.ToString();
+}
+
+String PerfSdkHud::LoadAvailableMetricsText() const
+{
+    if (!_active || !_impl)
+        return String::Empty;
+
+    auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
+    if (!impl->metricsEvaluatorRaw)
+        return String::Empty;
+
+    NVPW_MetricsEvaluator* evaluator = impl->metricsEvaluatorRaw;
+    StringBuilder sb;
+
+    auto appendMetrics = [&](NVPW_MetricType metricType, const Char* typeName)
+    {
+        const nv::perf::MetricsEnumerator enumerator = nv::perf::EnumerateMetrics(evaluator, metricType);
+        for (size_t i = 0; i < enumerator.size(); i++)
+        {
+            const char* baseMetricName = enumerator[i];
+            if (!baseMetricName || !baseMetricName[0])
+                continue;
+
+            NVPW_MetricType resolvedType = metricType;
+            size_t metricIndex = 0;
+            if (!nv::perf::GetMetricTypeAndIndex(evaluator, baseMetricName, resolvedType, metricIndex))
+                continue;
+
+            const std::string fullMetricName = BuildDefaultMetricEvalName(evaluator, resolvedType, metricIndex);
+            if (fullMetricName.empty())
+                continue;
+
+            const char* description = nv::perf::GetMetricDescription(evaluator, resolvedType, metricIndex);
+            sb.AppendFormat(TEXT("{0}\t{1}\t{2}\n"),
+                            String(fullMetricName.c_str()),
+                            typeName,
+                            description ? String(description) : String::Empty);
+        }
+    };
+
+    appendMetrics(NVPW_METRIC_TYPE_THROUGHPUT, TEXT("Throughput"));
+    appendMetrics(NVPW_METRIC_TYPE_RATIO, TEXT("Ratio"));
+    appendMetrics(NVPW_METRIC_TYPE_COUNTER, TEXT("Counter"));
+    return sb.ToString();
+}
+
+bool PerfSdkHud::TryAddUserMetric(const String& metricName, String& errorText)
+{
+    errorText.Clear();
+    if (!_active || !_impl)
+    {
+        errorText = TEXT("Perf SDK session is not active.");
+        return false;
+    }
+    if (metricName.IsEmpty())
+    {
+        errorText = TEXT("Metric name is empty.");
+        return false;
+    }
+
+    auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
+    const std::string metricNameUtf8 = ToUtf8Ascii(metricName);
+    if (MetricNameAlreadyActive(*impl, metricNameUtf8.c_str()))
+    {
+        errorText = TEXT("Metric is already shown.");
+        return false;
+    }
+
+    NVPW_MetricEvalRequest request{};
+    if (!impl->metricsEvaluatorRaw ||
+        !nv::perf::ToMetricEvalRequest(impl->metricsEvaluatorRaw, metricNameUtf8.c_str(), request))
+    {
+        errorText = TEXT("Metric is not supported on this GPU.");
+        return false;
+    }
+
+    for (const std::string& existing : impl->userMetricNames)
+    {
+        if (existing == metricNameUtf8)
+        {
+            errorText = TEXT("Metric is already added.");
+            return false;
+        }
+    }
+
+    impl->userMetricNames.push_back(metricNameUtf8);
+    String rebuildError;
+    if (!RebuildRangeCounterConfiguration(*impl, rebuildError))
+    {
+        impl->userMetricNames.pop_back();
+        errorText = rebuildError.IsEmpty() ? TEXT("Failed to rebuild metric configuration.") : rebuildError;
+        return false;
+    }
+
+    if (!MetricNameAlreadyActive(*impl, metricNameUtf8.c_str()))
+    {
+        impl->userMetricNames.pop_back();
+        errorText = TEXT("Could not schedule metric (hardware counter limit). Try a different metric.");
+        return false;
+    }
+
+    UpdateSessionStatus();
+    return true;
+}
+
+bool PerfSdkHud::TryRemoveUserMetric(const String& metricName, String& errorText)
+{
+    errorText.Clear();
+    if (!_active || !_impl)
+    {
+        errorText = TEXT("Perf SDK session is not active.");
+        return false;
+    }
+    if (metricName.IsEmpty())
+    {
+        errorText = TEXT("Metric name is empty.");
+        return false;
+    }
+
+    auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
+    const std::string metricNameUtf8 = ToUtf8Ascii(metricName);
+    auto it = std::find(impl->userMetricNames.begin(), impl->userMetricNames.end(), metricNameUtf8);
+    if (it == impl->userMetricNames.end())
+    {
+        errorText = TEXT("Only user-added metrics can be removed.");
+        return false;
+    }
+
+    impl->userMetricNames.erase(it);
+    String rebuildError;
+    if (!RebuildRangeCounterConfiguration(*impl, rebuildError))
+    {
+        impl->userMetricNames.push_back(metricNameUtf8);
+        errorText = rebuildError.IsEmpty() ? TEXT("Failed to rebuild metric configuration.") : rebuildError;
+        return false;
+    }
+
+    UpdateSessionStatus();
+    return true;
+}
+
+String PerfSdkHud::GetUserMetricNamesText() const
+{
+    if (!_active || !_impl)
+        return String::Empty;
+
+    auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
+    StringBuilder sb;
+    for (size_t i = 0; i < impl->userMetricNames.size(); i++)
+    {
+        if (i > 0)
+            sb.Append(TEXT("\n"));
+        sb.Append(String(impl->userMetricNames[i].c_str()));
+    }
+    return sb.ToString();
+}
+
+String PerfSdkHud::GetActiveMetricNamesText() const
+{
+    if (!_active || !_impl)
+        return String::Empty;
+
+    auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
+    StringBuilder sb;
+    for (size_t i = 0; i < impl->activeMetrics.size(); i++)
+    {
+        if (i > 0)
+            sb.Append(TEXT("\n"));
+        sb.Append(String(impl->activeMetrics[i].Def.MetricName.c_str()));
     }
     return sb.ToString();
 }
@@ -1595,6 +2041,10 @@ void PerfSdkHud::UpdateSessionStatus()
 {
 }
 
+void PerfSdkHud::PollRangeMetrics()
+{
+}
+
 void PerfSdkHud::OnProfilerGpuEventBegin(const Char*, int32, int32, GPUContext*)
 {
 }
@@ -1609,6 +2059,33 @@ void PerfSdkHud::GetDesignerMetrics(Array<RenderPerfTools::DesignerGpuMetric, In
 }
 
 String PerfSdkHud::GetChipAreasText() const
+{
+    return String::Empty;
+}
+
+String PerfSdkHud::LoadAvailableMetricsText() const
+{
+    return String::Empty;
+}
+
+bool PerfSdkHud::TryAddUserMetric(const String&, String& errorText)
+{
+    errorText = TEXT("Nsight Perf: COMPILE_WITH_RENDER_PERF_NVPERF build required.");
+    return false;
+}
+
+bool PerfSdkHud::TryRemoveUserMetric(const String&, String& errorText)
+{
+    errorText = TEXT("Nsight Perf: COMPILE_WITH_RENDER_PERF_NVPERF build required.");
+    return false;
+}
+
+String PerfSdkHud::GetUserMetricNamesText() const
+{
+    return String::Empty;
+}
+
+String PerfSdkHud::GetActiveMetricNamesText() const
 {
     return String::Empty;
 }

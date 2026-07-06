@@ -63,6 +63,36 @@ public:
     /// </summary>
     String GetChipAreasText() const;
 
+    /// <summary>
+    /// Polls range counter decode/evaluate on the editor tick (non-blocking; safe between GPU passes).
+    /// </summary>
+    void PollRangeMetrics();
+
+    /// <summary>
+    /// Enumerates all metrics supported on the current GPU. Each line: name\ttype\tdescription.
+    /// </summary>
+    String LoadAvailableMetricsText() const;
+
+    /// <summary>
+    /// Adds a user-selected metric to the live range profiler configuration.
+    /// </summary>
+    bool TryAddUserMetric(const String& metricName, String& errorText);
+
+    /// <summary>
+    /// Removes a previously added user metric.
+    /// </summary>
+    bool TryRemoveUserMetric(const String& metricName, String& errorText);
+
+    /// <summary>
+    /// Newline-separated metric names added by the user this session.
+    /// </summary>
+    String GetUserMetricNamesText() const;
+
+    /// <summary>
+    /// Newline-separated internal metric names currently shown in the table.
+    /// </summary>
+    String GetActiveMetricNamesText() const;
+
 private:
     bool _active = false;
     String _graphicsApiName;

@@ -2,7 +2,14 @@
 
 # PerfSDK Plugin
 
-NVIDIA Nsight PerfSDK integration for the Flax Editor GPU Profiler. Click a GPU profiler timeline bar or table row to open live chip counter metrics.
+NVIDIA Nsight PerfSDK integration for the Flax Editor GPU Profiler. Double-click a GPU profiler region to open live chip counter metrics for that draw range.
+
+## Features
+
+- Live throughput bars and counter values grouped by GPU subsystem (SM, caches, VRAM, raster, etc.)
+- **+ Add metric** — browse and add any supported NVPerf counter, ratio, or throughput metric at runtime
+- Custom metrics appear under a **Custom** group; built-in defaults stay available
+- Works while the scene is playing with the GPU profiler recording
 
 ## Requirements
 
@@ -13,9 +20,9 @@ NVIDIA Nsight PerfSDK integration for the Flax Editor GPU Profiler. Click a GPU 
 
 ## Setup
 
-1. Set `NVPERF_SDK_PATH` in your user/system environment.
+1. Set `NVPERF_SDK_PATH` in your user or system environment.
 2. On Linux, ensure the NvPerf host library directory is on the loader path. The plugin prepends `NvPerf/lib/a64` to `LD_LIBRARY_PATH` at runtime; you can also set it yourself before launching the editor.
-3. Clone plugin via Editor [Plugin Window tool](https://docs.flaxengine.com/manual/scripting/plugins/plugin-project.html#automated-git-cloning), ensure game project references it:
+3. Clone the plugin via the Editor [Plugin Window tool](https://docs.flaxengine.com/manual/scripting/plugins/plugin-project.html#automated-git-cloning), then reference it from your game project:
 
 ```
 ...
@@ -29,52 +36,58 @@ NVIDIA Nsight PerfSDK integration for the Flax Editor GPU Profiler. Click a GPU 
 ]
 ```
 
-4. Open the project and **Build & Run** (or compile scripts) so the PerfSDK plugin native module links against NVPerf.
-5. Play the scene, open **Profiler → GPU**, enable live recording, then **left-click** a region.
+4. Open the project and **Build & Run** (or **Tools → Recompile Scripts**) so the PerfSDK native module links against NVPerf. Check the Output Log for `Using PerfSDK v...` during compile.
+5. Play the scene, open **Profiler → GPU**, enable live recording, then **double-click** a region to open the metrics window.
 
-## Supported Platforms
+## Supported platforms
 
-Platforms:
-* Windows x64
-* Linux x64 (Vulkan only)
+| Platform | Graphics APIs |
+|----------|---------------|
+| Windows x64 | DirectX 11, DirectX 12, Vulkan |
+| Linux x64 | Vulkan only |
 
-Graphics APIs:
-* DirectX 11 (Windows)
-* DirectX 12 (Windows)
-* Vulkan (Windows and Linux)
+## Using the metrics window
 
-## API
+1. Double-click a GPU profiler region — the **Nvidia PerfSDK Metrics** window opens for that range.
+2. Click **+ Add metric** (toolbar or button) to open the picker.
+3. Load available metrics, filter by name or type, and click a row to add it.
+4. New metrics appear under **Custom** after the next sample collection cycle.
 
-In order to access PerfSDK API in C++/C# scripting import it in your code module (modify `Game.Build.cs` file):
+Status text at the top of the window shows session state (collecting passes, ready, errors). If profiling fails with `ERR_NVGPUCTRPERM`, enable GPU profiling permissions — see [NVIDIA ERR_NVGPUCTRPERM](https://developer.nvidia.com/ERR_NVGPUCTRPERM).
+
+## API (C# / C++ game code)
+
+To use PerfSDK types from your game scripts, import the module in `Game.Build.cs`:
 
 ```cs
 public override void Setup(BuildOptions options)
 {
     base.Setup(options);
 
-    // Adds PerfSDK module to PrivateDependencies if supported on current platform (Windows/Linux x64)
+    // Adds PerfSDK to PrivateDependencies when supported (Windows/Linux x64)
     PerfSDK.ConditionalImport(options, options.PrivateDependencies);
 }
 ```
+
+Game projects do not need this for the editor metrics UI — only if you call `RenderPerfTools` from your own code.
 
 ## Architecture
 
 | Layer | Location |
 |-------|----------|
-| Native NVPerf + HUD | `Plugins/PerfSDK/Source/PerfSDK/*.cpp` (plugin DLL) |
-| Metrics editor window | `Plugins/PerfSDK/Source/PerfSDK/PerfSdkMetricsWindow.cs` |
-| Editor plugin wiring | `Plugins/PerfSDK/Source/PerfSDK/PerfSDK.cs`, `GpuProfilerBridge.cs` |
-| GPU frame sampling hooks | `PerfSDK.cpp` via `RenderTask` delegates (no game C++) |
-| Profiler click plumbing | Engine `GpuProfilerRegionCallbacks` + `Timeline` / `GPU.cs` |
+| Native NVPerf + range profiler | `Source/PerfSDK/*.cpp` (plugin DLL) |
+| Metrics editor window | `Source/PerfSDK/PerfSdkMetricsWindow.cs` |
+| Add-metric picker | `Source/PerfSDK/PerfSdkAddMetricWindow.cs` |
+| Editor plugin wiring | `Source/PerfSDK/PerfSDK.cs`, `GpuProfilerBridge.cs` |
+| GPU frame hooks | `PerfSDK.cpp` via profiler callbacks |
+| Profiler click plumbing | Engine `GpuProfilerRegionCallbacks` + GPU profiler UI |
 
-**gearsDLSS game code has zero PerfSDK C++.** All native code lives in the plugin.
-
-The engine does **not** define `COMPILE_WITH_RENDER_PERF` or link NVPerf. Only the plugin does when `NVPERF_SDK_PATH` is set at build time.
+All native NVPerf code lives in the plugin. The Flax engine does **not** define `COMPILE_WITH_RENDER_PERF` or link NVPerf — only the plugin does when `NVPERF_SDK_PATH` is set at build time.
 
 ## Vulkan note
 
-PerfSDK needs extra Vulkan device extensions (`VK_EXT_buffer_device_address`, `VK_KHR_device_group`, plus NVPerf profiler extensions). The engine enables these at **device creation** when `NVPERF_SDK_PATH` is set **before starting the editor**.
+PerfSDK requires extra Vulkan device extensions (`VK_EXT_buffer_device_address`, `VK_KHR_device_group`, plus NVPerf profiler extensions). The engine enables these at **device creation** when `NVPERF_SDK_PATH` is set **before starting the editor**.
 
 1. Set `NVPERF_SDK_PATH` (and `VULKAN_SDK` for plugin builds).
 2. **Fully close and reopen Flax Editor** so Vulkan device creation picks up the extensions.
-3. Rebuild the engine (after engine changes) and Recompile Scripts.
+3. Rebuild the engine (if you changed engine sources) and **Recompile Scripts**.

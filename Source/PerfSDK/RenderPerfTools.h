@@ -68,7 +68,7 @@ public:
     API_PROPERTY() static String GetMetricsText();
 
     /// <summary>
-    /// Live chip-area rows for the editor metrics table. Each line: Area\tThroughput\tDetail\tHigherIsBetter.
+    /// Live chip-area rows for the editor metrics table. Each line: Area\tValueOrBar\tDetail\tHigherIsBetter\tFormat.
     /// </summary>
     API_PROPERTY() static String GetChipAreasText();
 
@@ -122,6 +122,37 @@ public:
     /// Editor/game tick fallback when render-task hooks do not run (call from metrics UI update).
     /// </summary>
     API_FUNCTION() static void TickSession();
+
+    /// <summary>
+    /// Cached list of GPU metrics from the active Perf SDK session. Each line: name\ttype\tdescription.
+    /// Call TryLoadAvailableMetrics before reading.
+    /// </summary>
+    API_PROPERTY() static String GetAvailableMetricsText();
+
+    /// <summary>
+    /// Enumerates metrics supported on the current GPU into AvailableMetricsText.
+    /// </summary>
+    API_FUNCTION() static bool TryLoadAvailableMetrics();
+
+    /// <summary>
+    /// Adds a metric (throughput, ratio, counter, etc.) to the live metrics table.
+    /// </summary>
+    API_FUNCTION() static bool TryAddUserMetric(const String& metricName);
+
+    /// <summary>
+    /// Removes a user-added metric from the live metrics table.
+    /// </summary>
+    API_FUNCTION() static bool TryRemoveUserMetric(const String& metricName);
+
+    /// <summary>
+    /// Newline-separated names of metrics added by the user this session.
+    /// </summary>
+    API_PROPERTY() static String GetUserMetricNamesText();
+
+    /// <summary>
+    /// Newline-separated internal metric names currently shown in the metrics table.
+    /// </summary>
+    API_PROPERTY() static String GetActiveMetricNamesText();
 
     /// <summary>
     /// Called before scene rendering to begin Perf SDK sampling for the frame.
