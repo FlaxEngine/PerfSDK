@@ -1,38 +1,39 @@
-#if FLAX_EDITOR && USE_PROFILER
-using FlaxEditor;
-using FlaxEditor.GUI.Docking;
+#if !FLAX_EDITOR && USE_PROFILER
+
 using FlaxEngine;
 using FlaxEngine.GUI;
-using NVIDIA;
 using System;
 using System.Collections.Generic;
 
-namespace FlaxEditor.Windows
+namespace NVIDIA
 {
     /// <summary>
-    /// Floating picker that lets users browse and add NVIDIA PerfSDK metrics at runtime.
+    /// Mode 2: Runtime metric picker for cooked build profiling.
     /// </summary>
-    public sealed class PerfSdkAddMetricWindow : EditorWindow
+    internal sealed class StandaloneAddMetricWindow
     {
-        private static readonly Float2 WindowSize = new Float2(640, 520);
+        private static readonly List<StandaloneAddMetricWindow> OpenWindows = new List<StandaloneAddMetricWindow>();
 
+        private static readonly Float2 WindowSize = new Float2(640, 520);
         private const float RowHeight = 28.0f;
         private const float ToolbarHeight = 30.0f;
         private const float FilterHeight = 24.0f;
         private const float StatusHeight = 18.0f;
         private const float Padding = 8.0f;
 
-        private readonly PerfSdkMetricsWindow _metricsWindow;
-
+        private Window _window;
+        private WindowRootControl _root;
+        private LayoutPanel _layout;
+        private StandaloneMetricsWindow _metricsWindow;
         private Label _statusLabel;
         private TextBox _filterBox;
         private Button _loadButton;
         private Panel _listScroll;
         private Panel _listContent;
-
         private readonly List<MetricEntry> _allMetrics = new List<MetricEntry>();
         private readonly HashSet<string> _addedMetricNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private bool _metricsLoaded;
+        private bool _catalogLoadPending;
 
         private struct MetricEntry
         {
@@ -41,17 +42,22 @@ namespace FlaxEditor.Windows
             public string Description;
         }
 
-        /// <summary>
-        /// Initializes a new instance of the <see cref="PerfSdkAddMetricWindow"/> class.
-        /// </summary>
-        /// <param name="editor">The editor.</param>
-        /// <param name="metricsWindow">The main metrics window to refresh after adding a metric.</param>
-        public PerfSdkAddMetricWindow(Editor editor, PerfSdkMetricsWindow metricsWindow)
-        : base(editor, true, ScrollBars.None)
+        private StandaloneAddMetricWindow(StandaloneMetricsWindow metricsWindow)
         {
             _metricsWindow = metricsWindow;
-            Title = "Add PerfSDK Metric";
-            Size = WindowSize;
+            _window = PerfSDKPlatform.CreateOverlayWindow("Add PerfSDK Metric", WindowSize, topmost: false);
+            if (_window == null)
+            {
+                Debug.LogError("PerfSDK: failed to create add-metric window.");
+                return;
+            }
+
+            _root = _window.GUI;
+            _root.BackgroundColor = Style.Current.Background;
+
+            _layout = new LayoutPanel { Parent = _root };
+            _layout.AnchorPreset = AnchorPresets.StretchAll;
+            _layout.Offsets = Margin.Zero;
 
             _statusLabel = new Label
             {
@@ -60,14 +66,14 @@ namespace FlaxEditor.Windows
                 HorizontalAlignment = TextAlignment.Near,
                 TextColor = Style.Current.Foreground * 0.75f,
                 Text = "Open a GPU profiler region, then load available metrics.",
-                Parent = this,
+                Parent = _layout,
             };
 
             float toolbarY = Padding + StatusHeight + 4.0f;
             _loadButton = new Button(Padding, toolbarY, 220.0f, ToolbarHeight)
             {
                 Text = "Show all available metrics",
-                Parent = this,
+                Parent = _layout,
             };
             _loadButton.Clicked += OnLoadMetricsClicked;
 
@@ -77,167 +83,217 @@ namespace FlaxEditor.Windows
                 Offsets = new Margin(Padding + 228.0f, Padding, toolbarY + 3.0f, FilterHeight),
                 WatermarkText = "Filter metrics...",
                 Enabled = false,
-                Parent = this,
+                Parent = _layout,
             };
-            _filterBox.TextChanged += OnFilterChanged;
+            _filterBox.TextChanged += OnFilterTextChanged;
 
             _listScroll = new Panel(ScrollBars.Vertical)
             {
                 AnchorPreset = AnchorPresets.StretchAll,
                 AlwaysShowScrollbars = true,
-                Parent = this,
+                Parent = _layout,
             };
 
-            _listContent = new Panel(ScrollBars.None)
+            _listContent = new Panel(ScrollBars.None) { Parent = _listScroll };
+
+            _layout.SizeChanged += OnLayoutSizeChanged;
+            _layout.PerformLayout();
+
+            _window.Closing += OnWindowClosing;
+            OpenWindows.Add(this);
+        }
+
+        void OnWindowClosing(ClosingReason reason, ref bool cancel)
+        {
+            OpenWindows.Remove(this);
+        }
+
+        public static void CloseAll()
+        {
+            for (int i = OpenWindows.Count - 1; i >= 0; i--)
             {
-                Parent = _listScroll,
-            };
-
-            SizeChanged += OnWindowSizeChanged;
-            PerformLayout();
+                var window = OpenWindows[i]._window;
+                if (window != null)
+                    window.Close(ClosingReason.EngineExit);
+            }
+            OpenWindows.Clear();
         }
 
-        /// <inheritdoc />
-        protected override void PerformLayoutBeforeChildren()
+        public static void TickPendingCatalogLoads()
         {
-            base.PerformLayoutBeforeChildren();
-
-            if (_statusLabel == null || _loadButton == null || _filterBox == null || _listScroll == null)
-                return;
-
-            float toolbarY = Padding + StatusHeight + 4.0f;
-            _statusLabel.Offsets = new Margin(Padding, Padding, Padding, StatusHeight);
-            _loadButton.Bounds = new Rectangle(Padding, toolbarY, 220.0f, ToolbarHeight);
-            _filterBox.Offsets = new Margin(Padding + 228.0f, Padding, toolbarY + 3.0f, FilterHeight);
-
-            float listTop = toolbarY + ToolbarHeight + 6.0f;
-            _listScroll.Offsets = new Margin(Padding, Padding, listTop, Padding);
-            if (_listContent != null)
-                _listContent.Width = Math.Max(100.0f, _listScroll.Width - 4.0f);
+            for (int i = 0; i < OpenWindows.Count; i++)
+                OpenWindows[i].TryCompleteCatalogLoad();
         }
 
-        void OnWindowSizeChanged(Control control)
+        void OnLayoutSizeChanged(Control control)
         {
+            UpdateListContentWidth();
             if (_metricsLoaded)
                 RebuildList();
         }
 
-        /// <inheritdoc />
-        public override Float2 DefaultSize => WindowSize;
-
-        /// <summary>
-        /// Opens or focuses the add-metric picker.
-        /// </summary>
-        /// <param name="editor">The editor.</param>
-        /// <param name="metricsWindow">The metrics window to refresh after changes.</param>
-        public static void ShowPicker(Editor editor, PerfSdkMetricsWindow metricsWindow)
+        void UpdateListContentWidth()
         {
-            var window = new PerfSdkAddMetricWindow(editor, metricsWindow);
-            window.ShowFloating(window.GetFloatingClientSize(), WindowStartPosition.CenterParent);
+            if (_listContent == null || _listScroll == null)
+                return;
+
+            _listContent.Width = Math.Max(100.0f, _listScroll.Width - 4.0f);
         }
 
-        /// <inheritdoc />
-        protected override void OnClose()
+        float GetRowWidth()
         {
-            HideOnClose = false;
-            base.OnClose();
+            if (_listContent != null && _listContent.Width > 0)
+                return _listContent.Width;
+            if (_listScroll != null && _listScroll.Width > 0)
+                return Math.Max(100.0f, _listScroll.Width - 4.0f);
+            return Math.Max(100.0f, WindowSize.X - Padding * 2 - 4.0f);
         }
 
-        /// <inheritdoc />
-        public override void OnDestroy()
+        public static void ShowPicker(StandaloneMetricsWindow metricsWindow)
         {
-            _listContent?.DisposeChildren();
-            base.OnDestroy();
-        }
+            if (metricsWindow == null)
+                return;
 
-        Float2 GetFloatingClientSize()
-        {
-            var dpi = (float)Platform.Dpi / 96.0f;
-            return WindowSize * dpi * Platform.CustomDpiScale;
-        }
-
-        void OnLoadMetricsClicked()
-        {
-            if (!RenderPerfTools.IsSessionActive)
+            for (int i = 0; i < OpenWindows.Count; i++)
             {
-                SetStatus("Open a GPU profiler region first (click a bar in Profiler → GPU).");
+                if (OpenWindows[i]._metricsWindow != metricsWindow)
+                    continue;
+
+                var existing = OpenWindows[i];
+                if (existing._window != null)
+                {
+                    existing._window.Show();
+                    existing._window.BringToFront();
+                }
                 return;
             }
 
+            var picker = new StandaloneAddMetricWindow(metricsWindow);
+            if (picker._window == null)
+                return;
+
+            picker._layout?.PerformLayout();
+            picker.UpdateListContentWidth();
+            picker._window.Show();
+            picker._window.BringToFront();
+            picker.BeginCatalogLoad();
+        }
+
+        void BeginCatalogLoad()
+        {
+            if (!RenderPerfTools.IsSessionActive)
+            {
+                SetStatus("Open a GPU profiler region first (double-click a bar in the GPU profiler).");
+                return;
+            }
+
+            if (TryCompleteCatalogLoad())
+                return;
+
+            _catalogLoadPending = true;
             if (!RenderPerfTools.TryLoadAvailableMetrics())
             {
                 SetStatus(RenderPerfTools.AvailableMetricsText);
                 return;
             }
 
-            ParseAvailableMetrics(RenderPerfTools.AvailableMetricsText);
-            RefreshAddedMetricNames();
-            _metricsLoaded = true;
-            _filterBox.Enabled = true;
-            _filterBox.Focus();
-            SetStatus(string.Format("Loaded {0} metrics. Click a row to add it.", _allMetrics.Count));
-            RebuildList();
+            FinishCatalogLoad();
         }
 
-        void OnFilterChanged()
+        void OnFilterTextChanged()
         {
             if (_metricsLoaded)
                 RebuildList();
         }
 
+        void OnLoadMetricsClicked()
+        {
+            if (!RenderPerfTools.IsSessionActive)
+            {
+                SetStatus("Open a GPU profiler region first (double-click a bar in the GPU profiler).");
+                return;
+            }
+
+            if (TryCompleteCatalogLoad())
+                return;
+
+            _catalogLoadPending = true;
+            if (!RenderPerfTools.TryLoadAvailableMetrics())
+            {
+                SetStatus(RenderPerfTools.AvailableMetricsText);
+                return;
+            }
+
+            FinishCatalogLoad();
+        }
+
+        bool TryCompleteCatalogLoad()
+        {
+            if (!_catalogLoadPending)
+                return false;
+
+            if (!RenderPerfTools.TryLoadAvailableMetrics())
+            {
+                SetStatus(RenderPerfTools.AvailableMetricsText);
+                return true;
+            }
+
+            FinishCatalogLoad();
+            return true;
+        }
+
+        void FinishCatalogLoad()
+        {
+            _catalogLoadPending = false;
+            ParseAvailableMetrics(RenderPerfTools.AvailableMetricsText);
+            RefreshAddedMetricNames();
+            _metricsLoaded = true;
+            _filterBox.Enabled = true;
+            SetStatus(string.Format("Loaded {0} metrics. Click a row to add it.", _allMetrics.Count));
+            RebuildList();
+        }
+
         void ParseAvailableMetrics(string text)
         {
             _allMetrics.Clear();
-            if (string.IsNullOrEmpty(text))
-                return;
+            if (string.IsNullOrEmpty(text)) return;
 
             string[] lines = text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
             for (int i = 0; i < lines.Length; i++)
             {
                 string[] parts = lines[i].Split('\t');
-                if (parts.Length < 2 || string.IsNullOrEmpty(parts[0]))
-                    continue;
-
-                _allMetrics.Add(new MetricEntry
-                {
-                    Name = parts[0],
-                    Type = parts[1],
-                    Description = parts.Length >= 3 ? parts[2] : string.Empty,
-                });
+                if (parts.Length < 2 || string.IsNullOrEmpty(parts[0])) continue;
+                _allMetrics.Add(new MetricEntry { Name = parts[0], Type = parts[1], Description = parts.Length >= 3 ? parts[2] : string.Empty });
             }
         }
 
         void RefreshAddedMetricNames()
         {
             _addedMetricNames.Clear();
-
             string activeMetrics = RenderPerfTools.ActiveMetricNamesText;
-            if (!string.IsNullOrEmpty(activeMetrics))
-            {
-                string[] lines = activeMetrics.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-                for (int i = 0; i < lines.Length; i++)
-                {
-                    if (!string.IsNullOrEmpty(lines[i]))
-                        _addedMetricNames.Add(lines[i]);
-                }
-            }
+            if (string.IsNullOrEmpty(activeMetrics)) return;
+            string[] lines = activeMetrics.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            for (int i = 0; i < lines.Length; i++)
+                if (!string.IsNullOrEmpty(lines[i])) _addedMetricNames.Add(lines[i]);
         }
 
         void RebuildList()
         {
+            _layout?.PerformLayout();
+            UpdateListContentWidth();
+
             _listContent.DisposeChildren();
             _listContent.LockChildrenRecursive();
 
             string filter = _filterBox?.Text ?? string.Empty;
             float y = 0.0f;
-            float rowWidth = Math.Max(100.0f, _listContent.Width - 4.0f);
+            float rowWidth = GetRowWidth();
             int visibleCount = 0;
 
             for (int i = 0; i < _allMetrics.Count; i++)
             {
                 MetricEntry entry = _allMetrics[i];
-                if (!MatchesFilter(entry, filter))
-                    continue;
+                if (!MatchesFilter(entry, filter)) continue;
 
                 bool alreadyAdded = _addedMetricNames.Contains(entry.Name);
                 var row = new MetricRowControl(entry, alreadyAdded, rowWidth, RowHeight)
@@ -264,41 +320,34 @@ namespace FlaxEditor.Windows
             }
 
             _listContent.Height = Math.Max(y, RowHeight);
+            _listContent.Width = rowWidth;
             _listContent.UnlockChildrenRecursive();
             _listScroll.PerformLayout();
         }
 
         static bool MatchesFilter(MetricEntry entry, string filter)
         {
-            if (string.IsNullOrEmpty(filter))
-                return true;
-
+            if (string.IsNullOrEmpty(filter)) return true;
             return entry.Name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                   entry.Type.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                   (!string.IsNullOrEmpty(entry.Description) && entry.Description.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0);
+                   entry.Type.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         void OnMetricAddClicked(string metricName)
         {
-            if (string.IsNullOrEmpty(metricName))
-                return;
-
             if (!RenderPerfTools.TryAddUserMetric(metricName))
             {
                 SetStatus(RenderPerfTools.ErrorText);
                 return;
             }
-
             _addedMetricNames.Add(metricName);
             _metricsWindow?.UpdateViewPublic(expandCustomGroup: true);
-            SetStatus("Added \"" + metricName + "\" — see Custom group in the main window.");
+            SetStatus("Queued \"" + metricName + "\" — applies on the next GPU frame.");
             RebuildList();
         }
 
         void SetStatus(string text)
         {
-            if (_statusLabel != null)
-                _statusLabel.Text = text ?? string.Empty;
+            if (_statusLabel != null) _statusLabel.Text = text ?? string.Empty;
         }
 
         private sealed class MetricRowControl : Control
@@ -306,7 +355,6 @@ namespace FlaxEditor.Windows
             private const float ActionColumnWidth = 56.0f;
 
             public event Action<string> AddClicked;
-
             private readonly MetricEntry _entry;
             private readonly bool _alreadyAdded;
             private bool _leftMouseDown;
@@ -319,24 +367,18 @@ namespace FlaxEditor.Windows
                 _alreadyAdded = alreadyAdded;
             }
 
-            /// <inheritdoc />
             public override void Draw()
             {
                 base.Draw();
-
                 var style = Style.Current;
                 var rowRect = new Rectangle(Float2.Zero, Size);
+                if (_alreadyAdded) Render2D.FillRectangle(rowRect, style.LightBackground * 0.35f);
+                else if (IsMouseOver) Render2D.FillRectangle(rowRect, style.BackgroundHighlighted * 0.45f);
 
-                if (_alreadyAdded)
-                    Render2D.FillRectangle(rowRect, style.LightBackground * 0.35f);
-                else if (IsMouseOver)
-                    Render2D.FillRectangle(rowRect, style.BackgroundHighlighted * 0.45f);
+                string title = _entry.Name;
+                if (!string.IsNullOrEmpty(_entry.Type)) title += "  [" + _entry.Type + "]";
 
                 float textWidth = Math.Max(0.0f, Width - ActionColumnWidth - 8.0f);
-                string title = _entry.Name;
-                if (!string.IsNullOrEmpty(_entry.Type))
-                    title += "  [" + _entry.Type + "]";
-
                 Render2D.DrawText(style.FontMedium, title, new Rectangle(4, 0, textWidth, Height * 0.55f), style.Foreground, TextAlignment.Near, TextAlignment.Center);
 
                 if (!string.IsNullOrEmpty(_entry.Description))
@@ -362,16 +404,18 @@ namespace FlaxEditor.Windows
                 }
             }
 
-            /// <inheritdoc />
+            public override void OnMouseLeave()
+            {
+                _leftMouseDown = false;
+                base.OnMouseLeave();
+            }
+
             public override bool OnMouseDown(Float2 location, MouseButton button)
             {
-                if (button == MouseButton.Left && !_alreadyAdded)
-                    _leftMouseDown = true;
-
+                if (button == MouseButton.Left && !_alreadyAdded) _leftMouseDown = true;
                 return true;
             }
 
-            /// <inheritdoc />
             public override bool OnMouseUp(Float2 location, MouseButton button)
             {
                 if (button == MouseButton.Left && _leftMouseDown && !_alreadyAdded)
@@ -380,15 +424,24 @@ namespace FlaxEditor.Windows
                     AddClicked?.Invoke(_entry.Name);
                     return true;
                 }
-
                 return base.OnMouseUp(location, button);
             }
+        }
 
-            /// <inheritdoc />
-            public override void OnMouseLeave()
+        private sealed class LayoutPanel : Panel
+        {
+            protected override void PerformLayoutBeforeChildren()
             {
-                _leftMouseDown = false;
-                base.OnMouseLeave();
+                base.PerformLayoutBeforeChildren();
+
+                float toolbarY = Padding + StatusHeight + 4.0f;
+                float listTop = toolbarY + ToolbarHeight + 6.0f;
+
+                foreach (var child in Children)
+                {
+                    if (child is Panel scroll && scroll.ScrollBars != ScrollBars.None)
+                        scroll.Offsets = new Margin(Padding, Padding, listTop, Padding);
+                }
             }
         }
     }

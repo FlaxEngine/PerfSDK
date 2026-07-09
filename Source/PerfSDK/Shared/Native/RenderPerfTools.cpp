@@ -1,6 +1,7 @@
 // Copyright (c) Wojciech Figat. All rights reserved.
 
 #include "RenderPerfTools.h"
+#include "PerfSdkPlatform.h"
 #include "Engine/Core/Types/StringBuilder.h"
 #include "Engine/Engine/Engine.h"
 #include "Engine/Graphics/GPUAdapter.h"
@@ -9,7 +10,9 @@
 #include "Engine/Graphics/Enums.h"
 #include "Engine/Graphics/RenderTask.h"
 #include "Engine/Platform/CriticalSection.h"
+#include "Engine/Platform/StringUtils.h"
 #include "Engine/Profiler/ProfilerGPU.h"
+#include "Engine/Threading/Threading.h"
 #include "PerfSdkHud.h"
 
 namespace
@@ -25,14 +28,32 @@ namespace
     static int32 RegionVertices = 0;
     static bool GpuFrameHooksInstalled = false;
     static uint64 LastProcessedGpuFrame = 0;
+    static uint32 MetricsRevision = 0;
+
+    static bool IsExcludedProfilerRegion(const Char* name)
+    {
+        return name && (StringUtils::Compare(name, TEXT("GUI")) == 0 || StringUtils::Compare(name, TEXT("Render2D")) == 0);
+    }
+
+    static bool IsExcludedProfilerRegion(const String& regionName)
+    {
+        return regionName == TEXT("GUI") || regionName == TEXT("Render2D");
+    }
 
 #if COMPILE_WITH_RENDER_PERF_NVPERF
     static PerfSdkHud Hud;
     static String AvailableMetricsText;
+    static bool PendingMetricsCatalogLoad = false;
+    static CriticalSection HudSessionLock;
 
     static void OnProfilerGpuEventBegin(const Char* name, int32 depth, int32 index, GPUContext* context)
     {
+        if (IsExcludedProfilerRegion(name))
+            return;
         if (!SessionActive)
+            return;
+        ScopeLock lock(HudSessionLock);
+        if (!SessionActive || !Hud.IsActive())
             return;
         Hud.OnProfilerGpuEventBegin(name, depth, index, context);
     }
@@ -40,6 +61,9 @@ namespace
     static void OnProfilerGpuEventEnd(int32 index, GPUContext* context)
     {
         if (!SessionActive)
+            return;
+        ScopeLock lock(HudSessionLock);
+        if (!SessionActive || !Hud.IsActive())
             return;
         Hud.OnProfilerGpuEventEnd(index, context);
     }
@@ -49,6 +73,9 @@ namespace
     {
         if (!SessionActive)
             return;
+        ScopeLock lock(HudSessionLock);
+        if (!SessionActive || !Hud.IsActive())
+            return;
         Hud.OnFrameBegin();
     }
 
@@ -57,9 +84,13 @@ namespace
     {
         if (!SessionActive)
             return;
+        ScopeLock lock(HudSessionLock);
+        if (!SessionActive || !Hud.IsActive())
+            return;
         Hud.OnFrameEnd();
         Hud.UpdateSessionStatus();
         Hud.GetDesignerMetrics(RenderPerfTools::DesignerMetrics);
+        MetricsRevision = Hud.GetMetricsRevision();
     }
 
     static void InstallProfilerGpuCallbacks()
@@ -104,6 +135,7 @@ String RenderPerfTools::GetRegionName()
 String RenderPerfTools::GetStatusText()
 {
 #if COMPILE_WITH_RENDER_PERF_NVPERF
+    ScopeLock lock(HudSessionLock);
     if (Hud.IsActive())
         return Hud.GetStatusText();
 #endif
@@ -121,6 +153,7 @@ String RenderPerfTools::GetMetricsText()
     }
 
 #if COMPILE_WITH_RENDER_PERF_NVPERF
+    ScopeLock lock(HudSessionLock);
     if (Hud.IsActive())
     {
         if (!Hud.GetGraphicsApiName().IsEmpty())
@@ -145,10 +178,21 @@ String RenderPerfTools::GetMetricsText()
 String RenderPerfTools::GetChipAreasText()
 {
 #if COMPILE_WITH_RENDER_PERF_NVPERF
-    if (Hud.IsActive())
+    ScopeLock lock(HudSessionLock);
+    if (SessionActive && Hud.IsActive())
         return Hud.GetChipAreasText();
 #endif
     return String::Empty;
+}
+
+uint32 RenderPerfTools::GetMetricsRevision()
+{
+#if COMPILE_WITH_RENDER_PERF_NVPERF
+    ScopeLock lock(HudSessionLock);
+    if (SessionActive && Hud.IsActive())
+        return Hud.GetMetricsRevision();
+#endif
+    return MetricsRevision;
 }
 
 String RenderPerfTools::GetErrorText()
@@ -178,6 +222,13 @@ int32 RenderPerfTools::GetRegionVertices()
 
 bool RenderPerfTools::TryOpenRegionProfiler(const String& regionName, int32 regionDepth, float gpuTimeMs, int32 drawCalls, int32 triangles, int32 vertices)
 {
+    if (IsExcludedProfilerRegion(regionName))
+    {
+        ErrorText = TEXT("GUI and Render2D are excluded from PerfSDK profiling.");
+        SessionActive = false;
+        return false;
+    }
+
 #if COMPILE_WITH_RENDER_PERF_NVPERF
     ErrorText.Clear();
     RegionName = regionName;
@@ -207,11 +258,12 @@ bool RenderPerfTools::TryOpenRegionProfiler(const String& regionName, int32 regi
         return false;
     }
 
+    ScopeLock lock(HudSessionLock);
     if (!Hud.IsActive())
     {
         if (!Hud.TryInitialize(device, adapter, context))
         {
-            ErrorText = Hud.GetStatusText();
+            ErrorText = PerfSdkPlatform::FormatErrorWithHint(Hud.GetStatusText(), device->GetRendererType());
             if (ErrorText.IsEmpty())
                 ErrorText = TEXT("Failed to initialize NVIDIA Perf SDK.");
             SessionActive = false;
@@ -225,7 +277,10 @@ bool RenderPerfTools::TryOpenRegionProfiler(const String& regionName, int32 regi
     InstallProfilerGpuCallbacks();
     EnsureGpuFrameHooks();
 
+    AvailableMetricsText.Clear();
+    PendingMetricsCatalogLoad = false;
     SessionActive = true;
+    MetricsRevision = Hud.GetMetricsRevision();
     return true;
 #else
     ErrorText = TEXT("PerfSDK plugin was built without NVIDIA Perf SDK support. Set NVPERF_SDK_PATH and rebuild scripts.");
@@ -236,11 +291,21 @@ bool RenderPerfTools::TryOpenRegionProfiler(const String& regionName, int32 regi
 
 void RenderPerfTools::CloseRegionProfiler()
 {
-    SessionActive = false;
     LastProcessedGpuFrame = 0;
+    MetricsRevision++;
 #if COMPILE_WITH_RENDER_PERF_NVPERF
+    SessionActive = false;
+    PendingMetricsCatalogLoad = false;
     RemoveProfilerGpuCallbacks();
-    Hud.Shutdown();
+    if (GPUDevice::Instance)
+        GPUDevice::Instance->WaitForGPU();
+    {
+        ScopeLock lock(HudSessionLock);
+        if (Hud.IsActive())
+            Hud.Shutdown();
+    }
+#else
+    SessionActive = false;
 #endif
     RegionName.Clear();
     RegionSummary.Clear();
@@ -258,24 +323,30 @@ void RenderPerfTools::CloseRegionProfiler()
 
 void RenderPerfTools::ProcessGpuFrameIfNeeded(GPUContext* context)
 {
+    (void)context;
 #if COMPILE_WITH_RENDER_PERF_NVPERF
-    // Range Profiler passes are driven by the engine DrawBegin/DrawEnd frame callbacks.
-    // This path only refreshes the editor UI text/metrics (safe to call from a UI tick).
-    if (!SessionActive || !Hud.IsActive())
-        return;
-    Hud.UpdateSessionStatus();
-    Hud.PollRangeMetrics();
-    Hud.GetDesignerMetrics(DesignerMetrics);
+    // Range decode/poll runs on the render thread in OnProfilerGpuFrameEnd (Hud.OnFrameEnd).
+    // UI tick must not call PollRangeMetrics — duplicate decode was spiking CPU every frame.
 #endif
 }
 
 void RenderPerfTools::TickSession()
 {
 #if COMPILE_WITH_RENDER_PERF_NVPERF
-    GPUDevice* device = GPUDevice::Instance;
-    if (!device)
+    if (!SessionActive)
         return;
-    ProcessGpuFrameIfNeeded(device->GetMainContext());
+
+    ScopeLock lock(HudSessionLock);
+    if (!SessionActive || !Hud.IsActive())
+        return;
+
+    Hud.TryProcessDeferredWork();
+
+    if (PendingMetricsCatalogLoad && IsInMainThread())
+    {
+        AvailableMetricsText = Hud.LoadAvailableMetricsText();
+        PendingMetricsCatalogLoad = false;
+    }
 #endif
 }
 
@@ -291,16 +362,24 @@ void RenderPerfTools::EnsureGpuFrameHooks()
 void RenderPerfTools::OnGpuFrameBegin()
 {
 #if COMPILE_WITH_RENDER_PERF_NVPERF
-    if (SessionActive)
-        Hud.OnFrameBegin();
+    if (!SessionActive)
+        return;
+    ScopeLock lock(HudSessionLock);
+    if (!SessionActive || !Hud.IsActive())
+        return;
+    Hud.OnFrameBegin();
 #endif
 }
 
 void RenderPerfTools::OnGpuFrameEnd()
 {
 #if COMPILE_WITH_RENDER_PERF_NVPERF
-    if (SessionActive)
-        Hud.OnFrameEnd();
+    if (!SessionActive)
+        return;
+    ScopeLock lock(HudSessionLock);
+    if (!SessionActive || !Hud.IsActive())
+        return;
+    Hud.OnFrameEnd();
 #endif
 }
 
@@ -316,13 +395,34 @@ String RenderPerfTools::GetAvailableMetricsText()
 bool RenderPerfTools::TryLoadAvailableMetrics()
 {
 #if COMPILE_WITH_RENDER_PERF_NVPERF
-    if (!SessionActive || !Hud.IsActive())
+    if (!SessionActive)
     {
         AvailableMetricsText = TEXT("Open a GPU profiler region first.");
         return false;
     }
-    AvailableMetricsText = Hud.LoadAvailableMetricsText();
-    return !AvailableMetricsText.IsEmpty();
+
+    if (!PendingMetricsCatalogLoad && !AvailableMetricsText.IsEmpty())
+        return true;
+
+    {
+        ScopeLock lock(HudSessionLock);
+        if (!SessionActive || !Hud.IsActive())
+        {
+            AvailableMetricsText = TEXT("Open a GPU profiler region first.");
+            return false;
+        }
+    }
+
+    if (PendingMetricsCatalogLoad)
+    {
+        if (AvailableMetricsText.IsEmpty())
+            AvailableMetricsText = TEXT("Loading available metrics on the GPU thread...");
+        return false;
+    }
+
+    PendingMetricsCatalogLoad = true;
+    AvailableMetricsText = TEXT("Loading available metrics on the GPU thread...");
+    return false;
 #else
     ErrorText = TEXT("PerfSDK plugin was built without NVIDIA Perf SDK support.");
     return false;
@@ -332,6 +432,7 @@ bool RenderPerfTools::TryLoadAvailableMetrics()
 bool RenderPerfTools::TryAddUserMetric(const String& metricName)
 {
 #if COMPILE_WITH_RENDER_PERF_NVPERF
+    ScopeLock lock(HudSessionLock);
     if (!SessionActive || !Hud.IsActive())
     {
         ErrorText = TEXT("Open a GPU profiler region first.");
@@ -354,6 +455,7 @@ bool RenderPerfTools::TryAddUserMetric(const String& metricName)
 bool RenderPerfTools::TryRemoveUserMetric(const String& metricName)
 {
 #if COMPILE_WITH_RENDER_PERF_NVPERF
+    ScopeLock lock(HudSessionLock);
     if (!SessionActive || !Hud.IsActive())
     {
         ErrorText = TEXT("Open a GPU profiler region first.");
@@ -376,6 +478,7 @@ bool RenderPerfTools::TryRemoveUserMetric(const String& metricName)
 String RenderPerfTools::GetUserMetricNamesText()
 {
 #if COMPILE_WITH_RENDER_PERF_NVPERF
+    ScopeLock lock(HudSessionLock);
     if (SessionActive && Hud.IsActive())
         return Hud.GetUserMetricNamesText();
 #endif
@@ -385,6 +488,7 @@ String RenderPerfTools::GetUserMetricNamesText()
 String RenderPerfTools::GetActiveMetricNamesText()
 {
 #if COMPILE_WITH_RENDER_PERF_NVPERF
+    ScopeLock lock(HudSessionLock);
     if (SessionActive && Hud.IsActive())
         return Hud.GetActiveMetricNamesText();
 #endif

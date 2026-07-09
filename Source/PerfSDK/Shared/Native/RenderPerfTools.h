@@ -73,6 +73,11 @@ public:
     API_PROPERTY() static String GetChipAreasText();
 
     /// <summary>
+    /// Increments when live metrics or status change. Use to avoid rebuilding the metrics UI every frame.
+    /// </summary>
+    API_PROPERTY() static uint32 GetMetricsRevision();
+
+    /// <summary>
     /// Game-designer friendly GPU throughput metrics (0-100%) updated while a session is active.
     /// </summary>
     API_FIELD(ReadOnly) static Array<DesignerGpuMetric, InlinedAllocation<32>> DesignerMetrics;
@@ -119,7 +124,7 @@ public:
     static void ProcessGpuFrameIfNeeded(GPUContext* context);
 
     /// <summary>
-    /// Editor/game tick fallback when render-task hooks do not run (call from metrics UI update).
+    /// Editor/game tick: applies deferred metric rebuild and metrics catalog load on the main thread.
     /// </summary>
     API_FUNCTION() static void TickSession();
 

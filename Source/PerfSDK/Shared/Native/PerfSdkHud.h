@@ -60,13 +60,33 @@ public:
 
     /// <summary>
     /// Tab-separated chip area rows for the editor metrics table (Area, throughput %, detail, higher-is-better flag).
+    /// Cached until metrics data changes.
     /// </summary>
     String GetChipAreasText() const;
 
     /// <summary>
-    /// Polls range counter decode/evaluate on the editor tick (non-blocking; safe between GPU passes).
+    /// Increments when chip-area metrics or session status text changes. UI can skip rebuilds when unchanged.
+    /// </summary>
+    uint32 GetMetricsRevision() const { return _metricsRevision; }
+
+    /// <summary>
+    /// Polls range counter decode/evaluate on the render thread (OnFrameEnd). Do not call from UI tick.
     /// </summary>
     void PollRangeMetrics();
+
+    void InvalidateMetricsCache();
+
+    /// <summary>
+    /// Merges queued user metric add/remove on the render thread at a safe frame boundary.
+    /// Heavy configuration rebuild (WaitForGPU / Vulkan idle) runs on the main thread via TryProcessDeferredWork.
+    /// Applies equally to D3D11, D3D12, and Vulkan backends.
+    /// </summary>
+    void ProcessPendingMetricChanges();
+
+    /// <summary>
+    /// Applies deferred metric configuration rebuild on the main thread. Required for D3D12 and Vulkan safety.
+    /// </summary>
+    bool TryProcessDeferredWork();
 
     /// <summary>
     /// Enumerates all metrics supported on the current GPU. Each line: name\ttype\tdescription.
@@ -98,5 +118,10 @@ private:
     String _graphicsApiName;
     String _overlayText;
     String _statusText;
+    mutable String _chipAreasTextCache;
+    mutable uint32 _metricsRevision = 0;
+    mutable uint32 _chipAreasCacheRevision = 0;
     void* _impl = nullptr;
+
+    String BuildChipAreasText() const;
 };

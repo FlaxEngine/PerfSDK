@@ -4,7 +4,12 @@ using Flax.Build;
 using Flax.Build.NativeCpp;
 
 /// <summary>
-/// NVIDIA PerfSDK module.
+/// NVIDIA PerfSDK module with dual-mode architecture:
+///   Mode 1 (Editor):  Source/PerfSDK/Editor/   — in-editor GPU profiler (F1 overlay + engine Profiler hook)
+///   Mode 2 (Runtime): Source/PerfSDK/Runtime/  — cooked build standalone profiler (F1)
+///   Shared:           Source/PerfSDK/Shared/    — NVPerf core + metrics UI components
+///
+/// Release builds: ZERO PerfSDK presence (gated by Profiler.Use + ConditionalImport).
 /// </summary>
 public class PerfSDK : GameModule
 {
@@ -23,10 +28,14 @@ public class PerfSDK : GameModule
     }
 
     /// <summary>
-    /// Conditionally imports module into the build depending on the target platform support.
+    /// Conditionally imports module into the build depending on platform and configuration.
+    /// Returns false for Release non-editor builds — guarantees zero PerfSDK in shipping builds.
     /// </summary>
     public static bool ConditionalImport(BuildOptions options, System.Collections.Generic.List<string> dependencies = null)
     {
+        if (options.Configuration == TargetConfiguration.Release && !options.Target.IsEditor)
+            return false;
+
         bool result = IsSupportedPlatform(options);
         result &= Profiler.Use(options);
         if (result && dependencies != null)
@@ -34,23 +43,24 @@ public class PerfSDK : GameModule
         return result;
     }
 
-    /// <inheritdoc />
     public override void Init()
     {
         base.Init();
-
         BuildNativeCode = true;
     }
 
-    /// <inheritdoc />
     public override void Setup(BuildOptions options)
     {
         base.Setup(options);
 
         options.PublicDependencies.Add("Engine");
         options.ScriptingAPI.IgnoreMissingDocumentationWarnings = true;
-        if (Profiler.Use(options))
-            options.ScriptingAPI.Defines.Add("USE_PROFILER");
+
+        // Release gate: profiler must be enabled for any PerfSDK code to compile
+        if (!Profiler.Use(options))
+            return;
+
+        options.ScriptingAPI.Defines.Add("USE_PROFILER");
 
         if (!IsSupportedPlatform(options))
             throw new InvalidPlatformException(options.Platform.Target);
@@ -58,7 +68,14 @@ public class PerfSDK : GameModule
         if (options.Architecture != TargetArchitecture.x64)
             throw new InvalidArchitectureException(options.Architecture);
 
-        // Select GPU APIs to support based on platform
+        // Native include path for Shared/Native/
+        string sharedNative = Path.Combine(FolderPath, "Shared", "Native");
+        if (Directory.Exists(sharedNative))
+            options.PrivateIncludePaths.Add(sharedNative);
+
+        // Platform GPU API selection — see docs/WINDOWS_SETUP.md for backend matrix.
+        // Windows: D3D11 + D3D12 + Vulkan. Linux: Vulkan only (no D3D defines).
+        // Native PerfSdkHud.cpp gates all D3D code behind GRAPHICS_API_DIRECTX11/12.
         switch (options.Platform.Target)
         {
         case TargetPlatform.Windows:
@@ -66,18 +83,20 @@ public class PerfSDK : GameModule
             options.PrivateDefinitions.Add("GRAPHICS_API_DIRECTX12");
             break;
         case TargetPlatform.Linux:
-            // Vulkan-only on Linux (Nsight Perf SDK has no D3D backends there).
             break;
         }
+
         if (VulkanSdk.Instance.IsValid && VulkanSdk.Instance.TryGetIncludePath(options.Platform.Target, out string vulkanInclude))
         {
             options.PrivateDefinitions.Add("GRAPHICS_API_VULKAN");
             options.PrivateIncludePaths.Add(vulkanInclude);
         }
+        else if (options.Platform.Target == TargetPlatform.Linux)
+            Log.Warning("PerfSDK: Vulkan SDK headers not found on Linux. Set VULKAN_SDK — Vulkan is the only supported backend on Linux.");
         else
             Log.Warning("PerfSDK: Vulkan SDK headers not found. Set VULKAN_SDK if the plugin fails to compile Vulkan code.");
 
-        // Find Perf SDK
+        // NVPerf SDK integration (optional — stubs when not available)
         string perfSdk = Environment.GetEnvironmentVariable("NVPERF_SDK_PATH");
         if (!string.IsNullOrEmpty(perfSdk))
             perfSdk = perfSdk.Trim();
@@ -91,9 +110,9 @@ public class PerfSDK : GameModule
         if (string.IsNullOrEmpty(perfInclude))
         {
             if (options.Platform.Target == TargetPlatform.Windows)
-                Log.Warning($"PerfSDK: NVPERF_SDK_PATH is '{perfSdk}' but neither 'redist/include' nor 'NvPerf/include' was found. Point NVPERF_SDK_PATH at the SDK root, restart the editor, then Recompile Scripts.");
+                Log.Warning($"PerfSDK: NVPERF_SDK_PATH is '{perfSdk}' but neither 'redist/include' nor 'NvPerf/include' was found.");
             else
-                Log.Warning($"PerfSDK: NVPERF_SDK_PATH is '{perfSdk}' but 'NvPerf/include' was not found. Point NVPERF_SDK_PATH at the Linux SDK root, restart the editor, then Recompile Scripts.");
+                Log.Warning($"PerfSDK: NVPERF_SDK_PATH is '{perfSdk}' but 'NvPerf/include' was not found.");
             return;
         }
 
@@ -110,7 +129,6 @@ public class PerfSDK : GameModule
             perfVersion = File.ReadAllText(versionFile);
         Log.InfoOnce($"Using PerfSDK v{perfVersion} ({perfSdk})", ref _logOnce);
 
-        // Include PerfSDK
         options.PublicDefinitions.Add("COMPILE_WITH_RENDER_PERF_NVPERF");
         options.PrivateIncludePaths.Add(perfInclude);
         options.PrivateIncludePaths.Add(platformInclude);

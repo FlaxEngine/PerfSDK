@@ -19,6 +19,7 @@
 #include "Engine/Platform/FileSystem.h"
 #include "Engine/Platform/Platform.h"
 #include "Engine/Platform/StringUtils.h"
+#include "Engine/Threading/Threading.h"
 #include "Engine/Utilities/StringConverter.h"
 
 #if COMPILE_WITH_RENDER_PERF_NVPERF
@@ -391,6 +392,13 @@ namespace
         uint32_t dbgRangePushCount = 0;     // command-list PushRange calls that succeeded
         uint32_t dbgDecodeCallCount = 0;    // DecodeCounters calls (poll)
         bool dbgLoggedFirstPush = false;
+
+        // Queued from UI thread; user metric lists are merged on the render thread at frame end.
+        // Configuration rebuild (WaitForGPU) runs on the main thread via TryProcessDeferredWork.
+        bool pendingMetricRebuild = false;
+        bool deferredConfigurationRebuild = false;
+        std::vector<std::string> pendingUserMetricAdds;
+        std::vector<std::string> pendingUserMetricRemoves;
     };
 
     static bool MetricNameAlreadyActive(const PerfSdkHudImpl& impl, const char* metricName)
@@ -767,8 +775,35 @@ namespace
     static void EndRangeSession(PerfSdkHudImpl& impl);
     static bool BeginRangeSession(PerfSdkHudImpl& impl);
 
+    // Drains in-flight GPU work before tearing down or rebuilding NVPerf configuration.
+    // Must run on the main thread (never from OnFrameEnd). Vulkan gets full queue/device idle.
+    static void IdleGpuForProfilerReconfiguration(PerfSdkHudImpl& impl)
+    {
+        if (!GPUDevice::Instance)
+            return;
+
+        GPUDevice::Instance->WaitForGPU();
+
+#if GRAPHICS_API_VULKAN
+        if (impl.backend == PerfSdkBackend::Vulkan)
+        {
+            if (impl.vkDevice && vkDeviceWaitIdle)
+                vkDeviceWaitIdle(impl.vkDevice);
+            if (impl.vkQueue && vkQueueWaitIdle)
+                vkQueueWaitIdle(impl.vkQueue);
+        }
+#endif
+    }
+
     static bool RebuildRangeCounterConfiguration(PerfSdkHudImpl& impl, String& statusText)
     {
+        if (!IsInMainThread())
+        {
+            impl.deferredConfigurationRebuild = true;
+            statusText = TEXT("Metric rebuild must run on the main thread.");
+            return false;
+        }
+
         if (!impl.metricsEvaluatorRaw)
         {
             statusText = TEXT("Nsight Perf: metrics evaluator is not ready.");
@@ -776,6 +811,9 @@ namespace
         }
 
         const bool wasSessionActive = impl.rangeSessionActive;
+
+        IdleGpuForProfilerReconfiguration(impl);
+
         EndRangeSession(impl);
         impl.rangeDataValid = false;
         impl.rangeMeasurementCount = 0;
@@ -1112,10 +1150,8 @@ namespace
         gPendingNvPerfSessionError.Clear();
         EndRangeSession(impl);
 
-        // D3D12/Vulkan: the queue-based NVPW BeginSession returns NVPA_STATUS_INVALID_CONTEXT_STATE when the
-        // command queue still has GPU work in flight (Flax has been rendering for many frames, unlike the
-        // reference samples that begin on a pristine queue). Idle the GPU so the queue is at a clean point
-        // before the profiler takes it over. Safe here because BeginRangeSession runs on the render thread.
+        // D3D12/Vulkan: BeginSession must run at OnFrameBegin (before queue submit), not after present.
+        // WaitForGPU here is safe only at frame start; metric rebuild uses IdleGpuForProfilerReconfiguration on the main thread.
         if (impl.backend != PerfSdkBackend::D3D11 && GPUDevice::Instance)
             GPUDevice::Instance->WaitForGPU();
 
@@ -1438,7 +1474,14 @@ bool PerfSdkHud::TryInitialize(GPUDevice* device, GPUAdapter* adapter, GPUContex
 
     _statusText = String::Format(TEXT("Nsight Perf: {0} | {1} | Range Profiler (per-region)"), _graphicsApiName, chipName);
     _overlayText = TEXT("Nsight Perf: select a GPU region to profile.");
+    InvalidateMetricsCache();
     return true;
+}
+
+void PerfSdkHud::InvalidateMetricsCache()
+{
+    _chipAreasCacheRevision = 0;
+    _metricsRevision++;
 }
 
 void PerfSdkHud::Shutdown()
@@ -1458,6 +1501,8 @@ void PerfSdkHud::Shutdown()
     delete impl;
     _impl = nullptr;
     _active = false;
+    _chipAreasTextCache.Clear();
+    InvalidateMetricsCache();
 }
 
 void PerfSdkHud::SetTargetRegion(const String& regionName, int32 regionDepth)
@@ -1506,6 +1551,7 @@ void PerfSdkHud::SetTargetRegion(const String& regionName, int32 regionDepth)
     }
 
     UpdateSessionStatus();
+    InvalidateMetricsCache();
 }
 
 void PerfSdkHud::OnFrameBegin()
@@ -1615,7 +1661,16 @@ void PerfSdkHud::OnFrameEnd()
     }
 
     // Decode whatever is ready (all backends; never blocks, re-arms the next cycle automatically).
+    const uint32 prevMeasurementCount = impl->rangeMeasurementCount;
+    const bool prevDataValid = impl->rangeDataValid;
+    const uint32 prevPassesSubmitted = impl->rangePassesSubmitted;
     PollRangeMetricsInternal(*impl);
+    if (prevMeasurementCount != impl->rangeMeasurementCount ||
+        prevDataValid != impl->rangeDataValid ||
+        prevPassesSubmitted != impl->rangePassesSubmitted)
+        InvalidateMetricsCache();
+
+    ProcessPendingMetricChanges();
 }
 
 void PerfSdkHud::OnProfilerGpuEventBegin(const Char* name, int32 depth, int32 index, GPUContext* context)
@@ -1741,10 +1796,13 @@ void PerfSdkHud::UpdateSessionStatus()
         return;
 
     auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
+    const String previousStatus = _statusText;
 
     if (!impl->regionProfilingActive)
     {
         _statusText = String::Format(TEXT("Nsight Perf: {0} | Range Profiler | select a GPU region"), _graphicsApiName);
+        if (_statusText != previousStatus)
+            InvalidateMetricsCache();
         return;
     }
     String state;
@@ -1767,6 +1825,8 @@ void PerfSdkHud::UpdateSessionStatus()
         impl->targetRegionDepth,
         impl->regionCompletionCount,
         state);
+    if (_statusText != previousStatus)
+        InvalidateMetricsCache();
 }
 
 void PerfSdkHud::GetDesignerMetrics(Array<RenderPerfTools::DesignerGpuMetric, InlinedAllocation<32>>& metrics) const
@@ -1791,7 +1851,7 @@ void PerfSdkHud::GetDesignerMetrics(Array<RenderPerfTools::DesignerGpuMetric, In
     }
 }
 
-String PerfSdkHud::GetChipAreasText() const
+String PerfSdkHud::BuildChipAreasText() const
 {
     if (!_active || !_impl)
         return String::Empty;
@@ -1838,6 +1898,19 @@ String PerfSdkHud::GetChipAreasText() const
         }
     }
     return sb.ToString();
+}
+
+String PerfSdkHud::GetChipAreasText() const
+{
+    if (!_active || !_impl)
+        return String::Empty;
+
+    if (_chipAreasCacheRevision == _metricsRevision && !_chipAreasTextCache.IsEmpty())
+        return _chipAreasTextCache;
+
+    _chipAreasTextCache = BuildChipAreasText();
+    _chipAreasCacheRevision = _metricsRevision;
+    return _chipAreasTextCache;
 }
 
 String PerfSdkHud::LoadAvailableMetricsText() const
@@ -1922,23 +1995,18 @@ bool PerfSdkHud::TryAddUserMetric(const String& metricName, String& errorText)
             return false;
         }
     }
-
-    impl->userMetricNames.push_back(metricNameUtf8);
-    String rebuildError;
-    if (!RebuildRangeCounterConfiguration(*impl, rebuildError))
+    for (const std::string& pending : impl->pendingUserMetricAdds)
     {
-        impl->userMetricNames.pop_back();
-        errorText = rebuildError.IsEmpty() ? TEXT("Failed to rebuild metric configuration.") : rebuildError;
-        return false;
+        if (pending == metricNameUtf8)
+        {
+            errorText = TEXT("Metric is already queued.");
+            return false;
+        }
     }
 
-    if (!MetricNameAlreadyActive(*impl, metricNameUtf8.c_str()))
-    {
-        impl->userMetricNames.pop_back();
-        errorText = TEXT("Could not schedule metric (hardware counter limit). Try a different metric.");
-        return false;
-    }
-
+    impl->pendingUserMetricAdds.push_back(metricNameUtf8);
+    impl->pendingMetricRebuild = true;
+    InvalidateMetricsCache();
     UpdateSessionStatus();
     return true;
 }
@@ -1960,21 +2028,90 @@ bool PerfSdkHud::TryRemoveUserMetric(const String& metricName, String& errorText
     auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
     const std::string metricNameUtf8 = ToUtf8Ascii(metricName);
     auto it = std::find(impl->userMetricNames.begin(), impl->userMetricNames.end(), metricNameUtf8);
-    if (it == impl->userMetricNames.end())
+    auto pendingIt = std::find(impl->pendingUserMetricAdds.begin(), impl->pendingUserMetricAdds.end(), metricNameUtf8);
+    if (it == impl->userMetricNames.end() && pendingIt == impl->pendingUserMetricAdds.end())
     {
         errorText = TEXT("Only user-added metrics can be removed.");
         return false;
     }
 
-    impl->userMetricNames.erase(it);
-    String rebuildError;
-    if (!RebuildRangeCounterConfiguration(*impl, rebuildError))
+    if (pendingIt != impl->pendingUserMetricAdds.end())
     {
-        impl->userMetricNames.push_back(metricNameUtf8);
-        errorText = rebuildError.IsEmpty() ? TEXT("Failed to rebuild metric configuration.") : rebuildError;
+        impl->pendingUserMetricAdds.erase(pendingIt);
+        InvalidateMetricsCache();
+        UpdateSessionStatus();
+        return true;
+    }
+
+    auto removeIt = std::find(impl->pendingUserMetricRemoves.begin(), impl->pendingUserMetricRemoves.end(), metricNameUtf8);
+    if (removeIt != impl->pendingUserMetricRemoves.end())
+    {
+        errorText = TEXT("Metric removal is already queued.");
         return false;
     }
 
+    impl->pendingUserMetricRemoves.push_back(metricNameUtf8);
+    impl->pendingMetricRebuild = true;
+    InvalidateMetricsCache();
+    UpdateSessionStatus();
+    return true;
+}
+
+void PerfSdkHud::ProcessPendingMetricChanges()
+{
+    if (!_active || !_impl)
+        return;
+
+    auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
+    if (!impl->pendingMetricRebuild &&
+        impl->pendingUserMetricAdds.empty() &&
+        impl->pendingUserMetricRemoves.empty())
+        return;
+
+    bool hadRemoves = !impl->pendingUserMetricRemoves.empty();
+    for (const std::string& metricName : impl->pendingUserMetricRemoves)
+    {
+        auto it = std::find(impl->userMetricNames.begin(), impl->userMetricNames.end(), metricName);
+        if (it != impl->userMetricNames.end())
+            impl->userMetricNames.erase(it);
+    }
+    impl->pendingUserMetricRemoves.clear();
+
+    const size_t pendingAddCount = impl->pendingUserMetricAdds.size();
+    for (const std::string& metricName : impl->pendingUserMetricAdds)
+        impl->userMetricNames.push_back(metricName);
+    impl->pendingUserMetricAdds.clear();
+
+    impl->pendingMetricRebuild = false;
+    if (hadRemoves || pendingAddCount > 0)
+        impl->deferredConfigurationRebuild = true;
+}
+
+bool PerfSdkHud::TryProcessDeferredWork()
+{
+    if (!_active || !_impl || !IsInMainThread())
+        return false;
+
+    auto* impl = static_cast<PerfSdkHudImpl*>(_impl);
+    if (!impl->deferredConfigurationRebuild)
+        return false;
+
+    impl->deferredConfigurationRebuild = false;
+    const size_t userMetricCountBefore = impl->userMetricNames.size();
+    String rebuildError;
+    if (!RebuildRangeCounterConfiguration(*impl, rebuildError))
+    {
+        if (userMetricCountBefore > 0 && impl->userMetricNames.size() > userMetricCountBefore)
+            impl->userMetricNames.resize(userMetricCountBefore);
+        if (!rebuildError.IsEmpty())
+            impl->lastSessionError = rebuildError;
+        LOG(Warning, "[PerfSDK] Deferred metric configuration rebuild failed: {0}", rebuildError);
+        InvalidateMetricsCache();
+        UpdateSessionStatus();
+        return false;
+    }
+
+    InvalidateMetricsCache();
     UpdateSessionStatus();
     return true;
 }
@@ -2027,6 +2164,15 @@ void PerfSdkHud::Shutdown()
 
 void PerfSdkHud::OnFrameBegin()
 {
+}
+
+void PerfSdkHud::ProcessPendingMetricChanges()
+{
+}
+
+bool PerfSdkHud::TryProcessDeferredWork()
+{
+    return false;
 }
 
 void PerfSdkHud::OnFrameEnd()
